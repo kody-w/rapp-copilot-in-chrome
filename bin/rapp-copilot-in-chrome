@@ -1,0 +1,31 @@
+#!/bin/sh
+# rapp-copilot-in-chrome
+# stdio MCP server bridging Copilot CLI -> Chrome via the Claude in Chrome extension.
+#
+# Architecture (reverse engineered):
+#   Copilot CLI (MCP client)
+#     -> this script  ->  `claude --claude-in-chrome-mcp`   [stdio MCP server]
+#     -> native messaging host  com.anthropic.claude_code_browser_extension
+#        (manifest: ~/Library/Application Support/Google/Chrome/NativeMessagingHosts/)
+#     -> Chrome extension  fcoeoabgfenejglbffodgkkbkcdhcgfn
+#     -> live tabs in the user's real, logged-in Chrome profile
+#
+# The server is self-contained: it does NOT require a Claude Code session to be running.
+
+set -e
+
+if [ -n "$RAPP_CHROME_CLAUDE_BIN" ] && [ -x "$RAPP_CHROME_CLAUDE_BIN" ]; then
+  CLAUDE_BIN="$RAPP_CHROME_CLAUDE_BIN"
+elif [ -x "$HOME/.local/bin/claude" ]; then
+  CLAUDE_BIN="$HOME/.local/bin/claude"
+else
+  CLAUDE_BIN="$(command -v claude 2>/dev/null || true)"
+fi
+
+if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
+  echo "rapp-copilot-in-chrome: cannot locate the 'claude' binary that hosts the browser bridge." >&2
+  echo "Install Claude Code, or set RAPP_CHROME_CLAUDE_BIN to its absolute path." >&2
+  exit 127
+fi
+
+exec "$CLAUDE_BIN" --claude-in-chrome-mcp
