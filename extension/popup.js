@@ -11,16 +11,32 @@ function render(s) {
   }
 }
 
-chrome.storage.local.get({ port: 8777, token: "", status: "", statusAt: 0 }).then((s) => {
+const defaults = {
+  port: 8777,
+  token: "",
+  profileName: "",
+  instanceId: "",
+  status: "",
+  statusAt: 0,
+};
+
+function load() {
+  return chrome.storage.local.get(defaults).then((s) => {
   $("port").value = s.port;
   $("token").value = s.token;
+  $("profileName").value = s.profileName;
+  $("instanceId").value = s.instanceId || "(assigned when service worker wakes)";
   render(s);
-});
+  });
+}
+
+load();
 
 $("save").addEventListener("click", async () => {
   await chrome.storage.local.set({
     port: parseInt($("port").value, 10) || 8777,
     token: $("token").value.trim(),
+    profileName: $("profileName").value.trim(),
   });
   // The service worker may be asleep; poking it makes "Save & connect" mean
   // what it says instead of "connect within the next 30 seconds".
@@ -28,4 +44,4 @@ $("save").addEventListener("click", async () => {
   setTimeout(() => chrome.storage.local.get(null).then(render), 600);
 });
 
-chrome.storage.onChanged.addListener(() => chrome.storage.local.get(null).then(render));
+chrome.storage.onChanged.addListener(() => load());

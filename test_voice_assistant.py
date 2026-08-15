@@ -5,12 +5,15 @@ import json
 import pathlib
 import subprocess
 import tempfile
+import threading
+from datetime import timedelta
 
 import voice_assistant as assistant
 
 tmp = pathlib.Path(tempfile.mkdtemp(prefix="voice-assistant-test-"))
 assistant.STATE_FILE = tmp / "state.json"
 assistant.CONFIG_FILE = tmp / "config.json"
+assistant.LOG_FILE = tmp / "assistant.log"
 assistant.CONFIG_FILE.write_text(
     json.dumps(
         {
@@ -180,4 +183,85 @@ assert sent == [], "all first-run history must remain watermarked"
 large_state = json.loads(assistant.STATE_FILE.read_text())
 assert len(large_state["handled"]) == 600
 
-print("voice assistant: 28 safety assertions passed")
+# A send that lands and then crashes must be finalized by readback, not sent
+# a second time.
+assistant.STATE_FILE = tmp / "crash-state.json"
+crash_messages = [
+    {
+        "direction": "inbound",
+        "from": "5558675309",
+        "body": "existing",
+        "raw": "existing",
+    }
+]
+assistant.collect = lambda cfg: list(crash_messages)
+assistant.tick(responder=responder, sender=sender)  # watermark
+crash_messages.append(
+    {
+        "direction": "inbound",
+        "from": "5558675309",
+        "body": "crash window",
+        "raw": "crash window",
+    }
+)
+deliveries = []
+def crash_after_delivery(cfg, text):
+    deliveries.append(text)
+    crash_messages.append(
+        {
+            "direction": "outbound",
+            "from": "you",
+            "body": text,
+            "raw": f"outbound {text}",
+        }
+    )
+    raise RuntimeError("simulated SIGKILL window")
+assert assistant.tick(
+    responder=responder,
+    sender=crash_after_delivery,
+) == 0
+assert assistant.load_state()["pending"] is not None
+def must_not_resend(cfg, text):
+    raise AssertionError("confirmed pending reply was sent twice")
+assert assistant.tick(responder=responder, sender=must_not_resend) == 0
+assert len(deliveries) == 1
+assert assistant.load_state()["pending"] is None
+
+# Corruption recovers from a known-good backup and never watermarks silently.
+assistant.STATE_FILE = tmp / "recover-state.json"
+first = assistant.default_state()
+first["initialized_at"] = "first"
+assistant.save_state(first)
+second = {**first, "initialized_at": "second"}
+assistant.save_state(second)
+assistant.STATE_FILE.write_text("{broken")
+recovered = assistant.load_state()
+assert recovered["initialized_at"] == "first"
+(assistant.STATE_FILE).unlink()
+assistant.state_backup_path().unlink(missing_ok=True)
+assistant.STATE_FILE.write_text("{broken")
+try:
+    assistant.load_state()
+    raise AssertionError("corrupt state without backup must fail closed")
+except RuntimeError as exc:
+    assert "no valid backup" in str(exc)
+
+# Future clock artifacts cannot lock the one-hour budget forever.
+future = assistant.iso(assistant.now() + timedelta(days=1))
+assert assistant.recent_reply_count({"replies": [{"at": future}]}) == 0
+
+# A second tick cannot enter while the durable-state lock is held.
+assistant.STATE_FILE = tmp / "lock-state.json"
+lock_results = []
+with assistant.tick_lock() as acquired:
+    assert acquired
+    thread = threading.Thread(
+        target=lambda: lock_results.append(
+            assistant.tick(responder=responder, sender=sender)
+        )
+    )
+    thread.start()
+    thread.join(timeout=3)
+assert lock_results == [0]
+
+print("voice assistant: 39 safety assertions passed")

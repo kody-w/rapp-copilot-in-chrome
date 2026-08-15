@@ -6,7 +6,7 @@
   <key>Label</key><string>com.rapp.voice-assistant</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/usr/bin/python3</string>
+    <string>__PYTHON__</string>
     <string>__RUNTIME__/voice_assistant.py</string>
     <string>--loop</string>
     <string>--interval</string>
@@ -29,7 +29,7 @@
     <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>__HOME__/.rappter-chrome/voice-assistant.stdout.log</string>
+  <string>/dev/null</string>
   <key>StandardErrorPath</key>
   <string>__HOME__/.rappter-chrome/voice-assistant.stderr.log</string>
 </dict>

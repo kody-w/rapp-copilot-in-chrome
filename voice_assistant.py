@@ -10,6 +10,7 @@ later tick retries it. The assistant never marks an intention as a delivery.
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -17,7 +18,9 @@ import re
 import subprocess
 import sys
 import time
+import tempfile
 import unicodedata
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -30,14 +33,24 @@ import gvoice  # noqa: E402
 CONFIG_FILE = Path.home() / ".rappter-chrome" / "config.json"
 STATE_FILE = Path.home() / ".rappter-chrome" / "voice-assistant-state.json"
 LOG_FILE = Path.home() / ".rappter-chrome" / "voice-assistant.log"
+MAX_LOG_BYTES = 2 * 1024 * 1024
+LOG_BACKUPS = 3
+
+
+def state_backup_path():
+    return STATE_FILE.with_suffix(".json.bak")
+
+
+def state_lock_path():
+    return STATE_FILE.with_suffix(".json.lock")
 
 
 def now():
     return datetime.now(timezone.utc)
 
 
-def iso():
-    return now().isoformat(timespec="seconds")
+def iso(value=None):
+    return (value or now()).isoformat(timespec="seconds")
 
 
 def load_json(path, default):
@@ -47,13 +60,116 @@ def load_json(path, default):
         return default
 
 
-def save_json(path, data):
+def default_state():
+    return {
+        "handled": [],
+        "transcript": [],
+        "replies": [],
+        "initialized_at": None,
+        "pending": None,
+    }
+
+
+def fsync_directory(path):
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_json_atomic(path, data):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    os.chmod(tmp, 0o600)
-    tmp.replace(path)
+    fd, temp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    temp = Path(temp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        fsync_directory(path.parent)
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def valid_state(data):
+    return (
+        isinstance(data, dict)
+        and isinstance(data.get("handled", []), list)
+        and isinstance(data.get("transcript", []), list)
+        and isinstance(data.get("replies", []), list)
+    )
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return default_state()
+    try:
+        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        if not valid_state(data):
+            raise ValueError("state has the wrong shape")
+        return {**default_state(), **data}
+    except Exception as primary:
+        try:
+            backup_path = state_backup_path()
+            backup = json.loads(backup_path.read_text(encoding="utf-8"))
+            if not valid_state(backup):
+                raise ValueError("backup has the wrong shape")
+            recovered = {**default_state(), **backup}
+            write_json_atomic(STATE_FILE, recovered)
+            log(f"recovered corrupt state from {backup_path.name}")
+            return recovered
+        except Exception as secondary:
+            raise RuntimeError(
+                f"state is unreadable and no valid backup exists: "
+                f"{primary}; backup: {secondary}"
+            ) from primary
+
+
+def save_state(data):
+    if not valid_state(data):
+        raise RuntimeError("refusing to save invalid Voice state")
+    if STATE_FILE.exists():
+        try:
+            current = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            if valid_state(current):
+                write_json_atomic(state_backup_path(), current)
+        except Exception:
+            # Preserve the last known-good backup rather than replacing it
+            # with a corrupt current file.
+            pass
+    write_json_atomic(STATE_FILE, data)
+
+
+@contextmanager
+def tick_lock():
+    lock_path = state_lock_path()
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        handle.close()
 
 
 def config():
@@ -74,6 +190,16 @@ def log(line):
     text = f"{iso()} {line}"
     print(text, flush=True)
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if LOG_FILE.exists() and LOG_FILE.stat().st_size >= MAX_LOG_BYTES:
+            for index in range(LOG_BACKUPS, 1, -1):
+                older = LOG_FILE.with_name(f"{LOG_FILE.name}.{index - 1}")
+                newer = LOG_FILE.with_name(f"{LOG_FILE.name}.{index}")
+                if older.exists():
+                    os.replace(older, newer)
+            os.replace(LOG_FILE, LOG_FILE.with_name(f"{LOG_FILE.name}.1"))
+    except OSError:
+        pass
     with open(LOG_FILE, "a", encoding="utf-8") as handle:
         handle.write(text + "\n")
 
@@ -120,11 +246,14 @@ def eligible(item, cfg):
 
 
 def recent_reply_count(state):
-    cutoff = now() - timedelta(hours=1)
+    current = now()
+    cutoff = current - timedelta(hours=1)
+    future_limit = current + timedelta(minutes=5)
     count = 0
     for record in state.get("replies", []):
         try:
-            if datetime.fromisoformat(record["at"]) > cutoff:
+            recorded = datetime.fromisoformat(record["at"])
+            if cutoff < recorded <= future_limit:
                 count += 1
         except Exception:
             continue
@@ -255,16 +384,72 @@ def deliver(cfg, text):
             raise RuntimeError("Google Voice did not confirm the reply")
 
 
-def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
+def outbound_count(items, text):
+    return sum(
+        1
+        for item in items
+        if item.get("direction") == "outbound"
+        and safe_text(item.get("body"), 900) == safe_text(text, 900)
+    )
+
+
+def finalize_delivery(state, pending, handled_order, handled, cfg):
+    mid = pending["message_id"]
+    if mid not in handled:
+        handled_order.append(mid)
+        handled.add(mid)
+    state["handled"] = handled_order
+    state.setdefault("transcript", []).extend(
+        [
+            {
+                "role": cfg["google_voice_owner"],
+                "text": safe_text(pending["inbound_text"], 4000),
+                "at": pending["created_at"],
+            },
+            {
+                "role": "Copilot",
+                "text": safe_text(pending["reply"], 900),
+                "at": iso(),
+            },
+        ]
+    )
+    state["transcript"] = state["transcript"][-40:]
+    state.setdefault("replies", []).append({"at": iso(), "message_id": mid})
+    state["replies"] = state["replies"][-100:]
+    state["pending"] = None
+    save_state(state)
+
+
+def _tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
     cfg = config()
     items = collect(cfg)
-    state = load_json(
-        STATE_FILE,
-        {"handled": [], "transcript": [], "replies": [], "initialized_at": None},
-    )
+    state = load_state()
     handled_order = list(dict.fromkeys(state.get("handled", [])))
     handled = set(handled_order)
     inbound = [(message_id(item), item) for item in items if eligible(item, cfg)]
+
+    pending = state.get("pending")
+    if pending:
+        already_landed = (
+            outbound_count(items, pending["reply"]) > pending["baseline"]
+        )
+        if already_landed:
+            finalize_delivery(state, pending, handled_order, handled, cfg)
+            log(f"recovered confirmed delivery: {pending['message_id']}")
+        else:
+            try:
+                sender(cfg, pending["reply"])
+                finalize_delivery(state, pending, handled_order, handled, cfg)
+                log(f"retried and verified pending delivery: {pending['message_id']}")
+            except Exception as exc:
+                log(
+                    f"pending delivery still unconfirmed for "
+                    f"{pending['message_id']}: {type(exc).__name__}: {exc}"
+                )
+                return 0
+        # Re-collect before considering other messages because the recovered
+        # send changed the thread and therefore outbound baselines.
+        items = collect(cfg)
 
     if not state.get("initialized_at"):
         state["initialized_at"] = iso()
@@ -282,7 +467,7 @@ def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
         # messages otherwise reclassifies its oldest rows as new on tick two.
         # Twenty-character IDs remain small even for years of conversation.
         state["handled"] = handled_order
-        save_json(STATE_FILE, state)
+        save_state(state)
         if not reply_latest:
             log(f"initialized: watermarked {len(inbound)} existing inbound messages")
             return 0
@@ -301,32 +486,45 @@ def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
     for mid, item in candidates[:budget]:
         try:
             reply = responder(item, state, cfg)
-            sender(cfg, reply)
         except Exception as exc:
-            log(f"reply failed for {mid}: {type(exc).__name__}: {exc}")
+            log(f"reply generation failed for {mid}: {type(exc).__name__}: {exc}")
             continue
 
-        if mid not in handled:
-            handled_order.append(mid)
-            handled.add(mid)
-        state["handled"] = handled_order
-        state.setdefault("transcript", []).extend(
-            [
-                {
-                    "role": cfg["google_voice_owner"],
-                    "text": safe_text(item["body"], 4000),
-                    "at": iso(),
-                },
-                {"role": "Copilot", "text": safe_text(reply, 900), "at": iso()},
-            ]
-        )
-        state["transcript"] = state["transcript"][-40:]
-        state.setdefault("replies", []).append({"at": iso(), "message_id": mid})
-        state["replies"] = state["replies"][-100:]
-        save_json(STATE_FILE, state)
+        pending = {
+            "message_id": mid,
+            "inbound_text": safe_text(item["body"], 4000),
+            "reply": safe_text(reply, 900),
+            "baseline": outbound_count(items, reply),
+            "created_at": iso(),
+        }
+        state["pending"] = pending
+        # The intent is durable BEFORE the irreversible send. A crash after
+        # delivery but before finalization is recovered by readback.
+        save_state(state)
+        try:
+            sender(cfg, pending["reply"])
+            finalize_delivery(state, pending, handled_order, handled, cfg)
+        except Exception as exc:
+            log(
+                f"delivery unconfirmed for {mid}: {type(exc).__name__}: {exc}; "
+                "durable pending intent retained"
+            )
+            break
         replied += 1
         log(f"replied and verified: {mid}")
     return replied
+
+
+def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
+    with tick_lock() as acquired:
+        if not acquired:
+            log("another Voice tick owns the state lock — skipping")
+            return 0
+        return _tick(
+            reply_latest=reply_latest,
+            responder=responder,
+            sender=sender,
+        )
 
 
 def run_loop(interval):
@@ -347,10 +545,18 @@ def main():
     parser.add_argument("--interval", type=int, default=60)
     parser.add_argument("--reply-latest", action="store_true")
     args = parser.parse_args()
-    if args.loop:
-        run_loop(max(30, args.interval))
-        return 0
-    return 0 if tick(reply_latest=args.reply_latest) >= 0 else 1
+    try:
+        # Validate once before entering a resident loop. A malformed fresh
+        # setup should print one useful error and exit, not traceback or log
+        # the same missing key forever.
+        config()
+        if args.loop:
+            run_loop(max(30, args.interval))
+            return 0
+        return 0 if tick(reply_latest=args.reply_latest) >= 0 else 1
+    except (BridgeError, RuntimeError) as exc:
+        print(f"voice assistant: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

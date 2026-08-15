@@ -67,11 +67,11 @@ script = textwrap.dedent(
         (target / "old-marker").write_text("old")
     original = module.swap_dir
     calls = {{"count": 0}}
-    def fail_second(stage, destination):
+    def fail_second(stage, destination, backup=None):
         calls["count"] += 1
         if calls["count"] == 2:
             raise RuntimeError("injected swap failure")
-        return original(stage, destination)
+        return original(stage, destination, backup)
     module.swap_dir = fail_second
     try:
         module.install(argparse.Namespace(keep_legacy=False, no_open=True))
@@ -92,3 +92,75 @@ rollback = subprocess.run(
 )
 assert rollback.returncode == 0, rollback.stderr
 print(rollback.stdout.strip())
+
+# SIGKILL after the first published directory leaves a journal that restores
+# the coherent previous generation on the next run.
+kill_home = pathlib.Path(tempfile.mkdtemp(prefix="rappter-install-kill-"))
+kill_env = {**os.environ, "HOME": str(kill_home)}
+baseline = subprocess.run(
+    [sys.executable, str(root / "install_local.py"), "--no-open"],
+    capture_output=True,
+    text=True,
+    env=kill_env,
+)
+assert baseline.returncode == 0, baseline.stderr
+for target in (
+    kill_home / ".rappter-chrome" / "runtime",
+    kill_home / ".rappter-chrome" / "extension",
+    kill_home / ".copilot" / "skills" / "rappter-chrome-local",
+):
+    (target / "old-marker").write_text("old")
+
+kill_script = textwrap.dedent(
+    f"""
+    import argparse, importlib.util, os
+    spec = importlib.util.spec_from_file_location(
+        "installer", {str(root / "install_local.py")!r}
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    original = module.swap_dir
+    calls = 0
+    def die_after_first(stage, destination, backup=None):
+        global calls
+        result = original(stage, destination, backup)
+        calls += 1
+        if calls == 1:
+            os._exit(77)
+        return result
+    module.swap_dir = die_after_first
+    module.install(argparse.Namespace(keep_legacy=False, no_open=True))
+    """
+)
+killed = subprocess.run(
+    [sys.executable, "-c", kill_script],
+    env=kill_env,
+)
+assert killed.returncode == 77
+journal = kill_home / ".rappter-chrome" / ".install-journal.json"
+assert journal.exists()
+
+recover_script = textwrap.dedent(
+    f"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "installer", {str(root / "install_local.py")!r}
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with module.install_lock():
+        module.recover_interrupted_install()
+    for target in (module.RUNTIME, module.EXTENSION, module.SKILL_DIR):
+        assert (target / "old-marker").read_text() == "old"
+    assert not module.JOURNAL.exists()
+    print("SIGKILL journal recovery passed")
+    """
+)
+recovered = subprocess.run(
+    [sys.executable, "-c", recover_script],
+    capture_output=True,
+    text=True,
+    env=kill_env,
+)
+assert recovered.returncode == 0, recovered.stderr
+print(recovered.stdout.strip())

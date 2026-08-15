@@ -418,8 +418,8 @@ def send(c, tab, who, text, confirm=True):
     if not clicked.get("ok"):
         raise SystemExit(f"could not send message: {clicked.get('why')}")
 
-    deadline = time.time() + 15
-    while time.time() < deadline:
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
         count = c.eval(
             tab,
             f"""(() => [...document.querySelectorAll(
