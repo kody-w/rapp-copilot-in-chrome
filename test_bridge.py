@@ -150,9 +150,26 @@ t4.join(timeout=10)
 check("server refused the token", "token" in (err4.get("msg") or "").lower(), err4.get("msg", "")[:70])
 sock4.close()
 
-print("\n5. ERRORS FROM THE PAGE SURFACE AS EXCEPTIONS")
+print("\n5. PRE-HEADER DISCONNECT CANNOT HANG THE SERVER")
 err5 = {}
 def serve5():
+    try:
+        with bridge.Chrome(port=PORT, wait=10):
+            err5["opened"] = True
+    except Exception as e:
+        err5["msg"] = str(e)
+t5 = threading.Thread(target=serve5, daemon=True); t5.start()
+time.sleep(0.4)
+aborted = socket.create_connection(("127.0.0.1", PORT), timeout=10)
+aborted.close()
+t5.join(timeout=3)
+check("handshake thread exits after peer EOF", not t5.is_alive())
+check("handshake reports peer close", "closed" in (err5.get("msg") or "").lower(),
+      err5.get("msg", "")[:70])
+
+print("\n6. ERRORS FROM THE PAGE SURFACE AS EXCEPTIONS")
+err5 = {}
+def serve6():
     try:
         with bridge.Chrome(port=PORT, wait=10) as c:
             c.call("click", selector="#nope")
@@ -161,14 +178,14 @@ def serve5():
         err5["raised"] = True; err5["msg"] = str(e)
     except Exception as e:
         err5["other"] = str(e)
-t5 = threading.Thread(target=serve5, daemon=True); t5.start()
+t6 = threading.Thread(target=serve6, daemon=True); t6.start()
 time.sleep(0.4)
 sock5, _, _ = client()
 send_masked(sock5, json.dumps({"hello": "test"}))
 op, data = read_server_frame(sock5)
 rid5 = json.loads(data)["id"]
 send_masked(sock5, json.dumps({"id": rid5, "ok": False, "error": "no element for #nope"}))
-t5.join(timeout=10)
+t6.join(timeout=10)
 check("raises rather than returning the error text", err5.get("raised") is True,
       err5.get("msg", err5.get("other", ""))[:70])
 sock5.close()

@@ -227,7 +227,10 @@ def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
                 if mid not in handled:
                     handled_order.append(mid)
                     handled.add(mid)
-        state["handled"] = handled_order[-500:]
+        # Do not truncate this watermark. A thread with >500 historical
+        # messages otherwise reclassifies its oldest rows as new on tick two.
+        # Twenty-character IDs remain small even for years of conversation.
+        state["handled"] = handled_order
         save_json(STATE_FILE, state)
         if not reply_latest:
             log(f"initialized: watermarked {len(inbound)} existing inbound messages")
@@ -255,7 +258,7 @@ def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
         if mid not in handled:
             handled_order.append(mid)
             handled.add(mid)
-        state["handled"] = handled_order[-500:]
+        state["handled"] = handled_order
         state.setdefault("transcript", []).extend(
             [
                 {

@@ -28,10 +28,14 @@ RUNTIME_FILES = [
 
 
 def load_json(path, default):
+    if not path.exists():
+        return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
+    except Exception as exc:
+        raise RuntimeError(
+            f"refusing to overwrite unreadable JSON at {path}: {exc}"
+        ) from exc
 
 
 def main():
@@ -66,6 +70,10 @@ def main():
 
     config = load_json(MCP_CONFIG, {"mcpServers": {}})
     servers = config.setdefault("mcpServers", {})
+    if not isinstance(servers, dict):
+        raise RuntimeError(
+            f"refusing to overwrite {MCP_CONFIG}: mcpServers is not an object"
+        )
     if not args.keep_legacy:
         servers.pop("rapp-copilot-in-chrome", None)
         LEGACY_LAUNCHER.unlink(missing_ok=True)
@@ -77,7 +85,9 @@ def main():
         "tools": ["*"],
     }
     MCP_CONFIG.parent.mkdir(parents=True, exist_ok=True)
-    MCP_CONFIG.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    config_tmp = MCP_CONFIG.with_suffix(".json.tmp")
+    config_tmp.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    config_tmp.replace(MCP_CONFIG)
     os.chmod(MCP_CONFIG, 0o600)
 
     if not args.no_open and sys.platform == "darwin":

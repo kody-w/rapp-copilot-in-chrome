@@ -94,4 +94,23 @@ older = {
 aged = {**older, "raw": "Aug 14\nsame message"}
 assert assistant.message_id(older) == assistant.message_id(aged)
 
-print("voice assistant: 9 safety assertions passed")
+assistant.STATE_FILE = tmp / "large-state.json"
+large_messages = [
+    {
+        "direction": "inbound",
+        "from": "5558675309",
+        "body": f"history {index}",
+        "label": f"Message from 5 5 5, history {index}, January 1 2020, 1:00 PM.",
+        "raw": f"history {index}",
+    }
+    for index in range(600)
+]
+assistant.collect = lambda cfg: list(large_messages)
+sent.clear()
+assert assistant.tick(responder=responder, sender=sender) == 0
+assert assistant.tick(responder=responder, sender=sender) == 0
+assert sent == [], "all first-run history must remain watermarked"
+large_state = json.loads(assistant.STATE_FILE.read_text())
+assert len(large_state["handled"]) == 600
+
+print("voice assistant: 13 safety assertions passed")

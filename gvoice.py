@@ -116,6 +116,7 @@ def first_match(c, tab, kind, limit=40):
 
 def open_voice(c):
     want = expected_account()
+    target_url = config().get("google_voice_url") or MESSAGES_URL
     voice_tabs = [tab for tab in c.tabs() if "voice.google.com" in (tab.get("url") or "")]
     accounts = {}
     tab = None
@@ -126,21 +127,22 @@ def open_voice(c):
             tab = candidate["tabId"]
             break
 
-    if want and tab is None:
-        seen = ", ".join(sorted(accounts)) or "none"
-        raise SystemExit(
-            f"Google Voice account mismatch: expected {want}, open accounts: {seen}. "
-            "Refusing to send from the wrong number."
-        )
-
     if tab is None:
-        tab = c.open(MESSAGES_URL)
+        # Cold start is ordinary: the browser may have no Voice tab yet. Open
+        # the configured /u/N surface, wait for the account chip, then apply
+        # the same strict identity check used for pre-existing tabs.
+        tab = c.open(target_url, reuse=False)
+        try:
+            c.waitfor(tab, '[aria-label^="Google Account:"]', timeout=15000)
+        except BridgeError:
+            pass
 
     account = account_for_tab(c, tab)
     if want and account != want:
+        seen = ", ".join(sorted(accounts)) or "none"
         raise SystemExit(
             f"Google Voice account mismatch: expected {want}, got {account or 'unknown'}. "
-            "Refusing to send from the wrong number."
+            f"Previously open accounts: {seen}. Refusing to send from the wrong number."
         )
 
     # Preserve /u/N from the tab selected above. Navigating an account-matched
@@ -223,6 +225,24 @@ def messages_url_for_tab(c, tab):
     )
 
 
+def wait_for_thread(c, tab, attempts=60, delay=0.25):
+    """Wait for either an existing message or a visible compose box."""
+    expression = """(() => {
+      if (document.querySelector('gv-message-item')) return true;
+      return [...document.querySelectorAll(
+        'textarea,div[contenteditable="true"][role="textbox"]'
+      )].some(element => !!element.offsetParent);
+    })()"""
+    for _ in range(attempts):
+        try:
+            if c.eval(tab, expression):
+                return True
+        except BridgeError:
+            pass
+        time.sleep(delay)
+    return False
+
+
 def open_thread(c, tab, who):
     digits = re.sub(r"\D", "", who)
     if len(digits) >= 7:
@@ -233,10 +253,10 @@ def open_thread(c, tab, who):
         # the thread asynchronously afterwards. Reading immediately produced
         # an empty list and the watcher reported "no new inbound messages"
         # while the reply was visibly present in the browser.
-        try:
-            c.waitfor(tab, "gv-message-item", timeout=15000)
-        except BridgeError:
-            pass
+        if not wait_for_thread(c, tab):
+            raise BridgeError(
+                f"Google Voice thread for {number} did not render within 15 seconds"
+            )
         return {"who": number, "i": None}
 
     sel, tl = threads(c, tab)
@@ -245,12 +265,10 @@ def open_thread(c, tab, who):
         names = ", ".join(t["who"] for t in tl[:12])
         raise SystemExit(f"no conversation matching {who!r}. Open threads: {names}")
     c.click(tab, sel, index=hit["i"])
-    for bsel in SELECTORS["bubbles"]:
-        try:
-            c.waitfor(tab, bsel, timeout=10000)
-            return hit
-        except BridgeError:
-            continue
+    if not wait_for_thread(c, tab, attempts=40):
+        raise BridgeError(
+            f"Google Voice thread for {hit['who']} did not render within 10 seconds"
+        )
     return hit
 
 
