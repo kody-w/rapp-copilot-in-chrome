@@ -9,6 +9,7 @@ from pathlib import Path
 root = Path(__file__).resolve().parent
 sys.path.insert(0, str(root))
 from rappter_chrome_mcp import batch_step
+from rappter_chrome_mcp import Server, handle
 
 assert batch_step(
     "read_page",
@@ -17,6 +18,31 @@ assert batch_step(
     "cmd": "query",
     "args": {"tabId": 7, "selector": "a", "limit": 3},
 }
+
+server = Server()
+assert handle(server, [])["error"]["code"] == -32600
+assert handle(
+    server,
+    {"jsonrpc": "2.0", "id": None, "method": "ping"},
+) == {"jsonrpc": "2.0", "id": None, "result": {}}
+assert handle(
+    server,
+    {"jsonrpc": "2.0", "method": "ping"},
+) is None
+assert handle(
+    server,
+    {"jsonrpc": "2.0", "id": 9, "method": "missing"},
+)["error"]["code"] == -32601
+assert handle(
+    server,
+    {"jsonrpc": "2.0", "id": 10, "method": "ping", "params": 1},
+)["error"]["code"] == -32602
+try:
+    server.call("not-a-tool", {})
+    raise AssertionError("unknown tool should fail")
+except Exception as exc:
+    assert "unknown tool" in str(exc)
+assert server.chrome is None
 assert batch_step(
     "computer",
     {"tabId": 7, "action": "click", "selector": "button", "index": 2},
@@ -76,7 +102,34 @@ try:
     assert "form_input" in names
     assert "javascript_tool" in names
     assert "browser_batch" in names
-    print(f"MCP server: initialize + {len(names)} tools + batch mappings passed")
+    print(
+        f"MCP server: initialize + {len(names)} tools + batch mappings "
+        "+ JSON-RPC validation passed"
+    )
 finally:
     process.terminate()
     process.wait(timeout=5)
+
+binary = subprocess.Popen(
+    [sys.executable, str(root / "rappter_chrome_mcp.py")],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+)
+try:
+    binary.stdin.write(b"\xff\n")
+    binary.stdin.write(b"{broken\n")
+    binary.stdin.write(
+        json.dumps(
+            {"jsonrpc": "2.0", "id": 33, "method": "ping"}
+        ).encode()
+        + b"\n"
+    )
+    binary.stdin.flush()
+    replies = [json.loads(binary.stdout.readline()) for _ in range(3)]
+    assert replies[0]["error"]["code"] == -32700
+    assert replies[1]["error"]["code"] == -32700
+    assert replies[2] == {"jsonrpc": "2.0", "id": 33, "result": {}}
+    print("MCP malformed-byte recovery passed")
+finally:
+    binary.terminate()
+    binary.wait(timeout=5)

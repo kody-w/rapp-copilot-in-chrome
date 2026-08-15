@@ -97,17 +97,18 @@ browse local files or invoke machine tools.
 ### Verify
 
 ```bash
-python3 test_bridge.py           # 14 protocol/security checks
-python3 test_mcp.py              # initialize, 11 tools, batch translations
+python3 test_bridge.py           # 17 protocol/security/concurrency checks
+python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translations
 python3 test_gvoice.py           # cold start and stale-thread refusal
-python3 test_voice_assistant.py  # 13 message-loop safety assertions
-python3 test_install_local.py    # malformed config cannot be overwritten
+python3 test_voice_assistant.py  # 28 injection, identity, watermark assertions
+python3 test_install_local.py    # config, concurrency, and rollback safety
 ```
 
 The protocol suite covers 64-bit WebSocket frames with a 70KB payload, ping/pong, masking,
-pre-header disconnects, error propagation, hostile web origins, and wrong tokens. Voice tests
-also exercise inboxes larger than 500 messages so first-run history cannot be replayed after
-watermark truncation.
+pre-header disconnects, malformed JSON/UTF-8 recovery, hostile web origins, and wrong tokens.
+Voice tests exercise inboxes larger than 500 messages, same-time duplicate text, prompt/control
+injection, and unsafe action-claim filtering. Installer tests exercise concurrent processes and
+rollback after an injected mid-transaction failure.
 
 ## Claude compatibility bridge
 
@@ -253,7 +254,7 @@ test_bridge.py                    protocol and security tests
 test_mcp.py                       MCP protocol smoke test
 test_gvoice.py                    browser cold-start and DOM-settle tests
 test_voice_assistant.py           message-loop safety tests
-test_install_local.py             config-clobber regression test
+test_install_local.py             config, concurrency, and rollback tests
 ```
 
 ## Manual install
