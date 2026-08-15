@@ -15,6 +15,8 @@ RUNTIME = ROOT / "runtime"
 EXTENSION = ROOT / "extension"
 MCP_CONFIG = HOME / ".copilot" / "mcp-config.json"
 SKILL_DIR = HOME / ".copilot" / "skills" / "rappter-chrome-local"
+LEGACY_LAUNCHER = HOME / ".copilot" / "bin" / "rapp-copilot-in-chrome"
+LEGACY_SKILL = HOME / ".copilot" / "skills" / "rapp-copilot-in-chrome"
 
 RUNTIME_FILES = [
     "bridge.py",
@@ -66,6 +68,8 @@ def main():
     servers = config.setdefault("mcpServers", {})
     if not args.keep_legacy:
         servers.pop("rapp-copilot-in-chrome", None)
+        LEGACY_LAUNCHER.unlink(missing_ok=True)
+        shutil.rmtree(LEGACY_SKILL, ignore_errors=True)
     servers["rappter-chrome-local"] = {
         "type": "local",
         "command": "/usr/bin/python3",
@@ -89,6 +93,8 @@ def main():
     print(f"  MCP:       {MCP_CONFIG} -> rappter-chrome-local")
     print(f"  skill:     {SKILL_DIR}")
     print(f"  token:     {shared_token}")
+    if not args.keep_legacy:
+        print("  legacy:    Anthropic launcher/config removed")
     print()
     print("Load the extension folder as unpacked, paste the token in its popup,")
     print("then restart Copilot CLI. No Claude binary or vendor login is used.")
