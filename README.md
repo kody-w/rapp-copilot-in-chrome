@@ -1,20 +1,111 @@
 # rapp-copilot-in-chrome
 
-**Drive your real, logged-in Chrome from GitHub Copilot CLI.**
+**Drive your real, logged-in Edge/Chrome from GitHub Copilot CLI.**
 
 Not a headless throwaway browser — *your* browser, with your profile, your cookies, and your
 authenticated sessions. Navigate, click, type, screenshot, read the accessibility tree, run
 JavaScript, and inspect console and network traffic, all from Copilot CLI.
 
+Recommended — local extension, local stdio MCP, no vendor account:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/kody-w/rapp-copilot-in-chrome/main/install-local.sh | sh
+```
+
+The reverse-engineered Claude bridge remains available as a compatibility backend:
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kody-w/rapp-copilot-in-chrome/main/install.sh | sh
 ```
 
-Then restart Copilot CLI and ask for browser work.
-
 ---
 
-## What this is
+## Vendorless local bridge (recommended)
+
+The original reverse engineering proved the useful boundary was a stdio MCP server. The next step
+was removing the vendor from both sides of it:
+
+```
+Copilot CLI
+  -> ~/.rappter-chrome/runtime/rappter_chrome_mcp.py
+  -> localhost WebSocket (127.0.0.1 only)
+  -> unpacked MV3 extension
+  -> your real Edge/Chrome tabs
+```
+
+The extension **dials out**. That inversion removes the native-messaging manifest, browser restart,
+Claude binary, and claude.ai login in one move: nothing needs to spawn a native host.
+
+| | Local bridge | Claude compatibility bridge |
+| --- | --- | --- |
+| Vendor binary | none | Claude Code |
+| Vendor account | none | matching claude.ai login |
+| Native messaging manifest | none | required |
+| Python packages | none (stdlib) | none |
+| Browser | Edge or Chrome | Claude extension's supported browsers |
+
+### Install
+
+The installer copies a portable runtime and extension to `~/.rappter-chrome`, generates a
+machine-local token, registers `rappter-chrome-local` in Copilot's MCP config, and opens the
+extensions page.
+
+1. Enable **Developer mode**.
+2. Choose **Load unpacked** and select `~/.rappter-chrome/extension`.
+3. Open the extension popup and paste the token printed by the installer.
+4. Restart Copilot CLI.
+
+The popup says **waiting for a local server** while idle. That is healthy: the MCP server is
+one-shot and exists only while Copilot is using browser tools.
+
+### The 11 local tools
+
+`tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`, `navigate`, `get_page_text`,
+`read_page`, `form_input`, `computer`, `javascript_tool`, `browser_batch`, and
+`list_connected_browsers`.
+
+They preserve the core names from the compatibility bridge, so existing browser prompts need
+little or no adaptation. Ordinary click/type/read operations use declared functions through
+`chrome.scripting`; arbitrary JavaScript attaches `chrome.debugger` only for that call and detaches
+afterwards.
+
+### Security boundary
+
+This drives a real authenticated profile. Three independent guards protect the socket:
+
+- binds `127.0.0.1`, never `0.0.0.0`;
+- a random 192-bit token stored mode `0600`;
+- the WebSocket `Origin` must begin `chrome-extension://`.
+
+A web page that guesses the port receives `403 Forbidden` before the WebSocket upgrade. A client
+with the wrong token receives `401 Unauthorized`. Both are protocol-tested.
+
+### Google Voice and persistent Copilot chat
+
+`gvoice.py` operates the signed-in Google Voice web app and confirms sent text by reading it back
+as an outgoing message. `voice_assistant.py` locks both the Google account and peer number through
+`~/.rappter-chrome/config.json`, watermarks existing history on first run, and uses:
+
+```
+read inbound -> ask Copilot with zero tools -> send -> confirm -> mark handled
+```
+
+Model generation or delivery failure leaves the message unhandled for retry. The assistant runs
+Copilot in an empty sandbox with `--available-tools=` and built-in MCPs disabled, so an SMS cannot
+browse local files or invoke machine tools.
+
+### Verify
+
+```bash
+python3 test_bridge.py           # RFC6455 + origin/token guards
+python3 test_mcp.py              # initialize + tool schemas
+python3 test_voice_assistant.py  # watermark, sender lock, dedupe, code filter
+```
+
+The protocol suite covers 64-bit WebSocket frames with a 70KB payload, ping/pong, masking,
+error propagation, hostile web origins, and wrong tokens.
+
+## Claude compatibility bridge
 
 Claude Code ships a browser bridge it calls `claude-in-chrome`. It is not a published MCP package
 and it is not documented — it is wired into the Claude binary. This repo is the result of reverse
@@ -146,7 +237,17 @@ SKILL.md                          toasted skill — the browser-usage guide
 rapp_copilot_in_chrome_agent.py   toasted agent — install / status / doctor / uninstall
 bin/rapp-copilot-in-chrome        launcher shim installed into ~/.copilot/bin
 docs/tools.json                   JSON Schemas for all 22 tools
-install.sh                        one-liner installer
+install.sh                        Claude compatibility installer
+install-local.sh                  vendorless installer
+install_local.py                  portable local installer
+extension/                        vendorless MV3 extension
+bridge.py                         zero-dependency localhost WebSocket transport
+rappter_chrome_mcp.py             11-tool stdio MCP server
+gvoice.py                         account-locked Google Voice browser driver
+voice_assistant.py                persistent, verified Copilot SMS loop
+test_bridge.py                    protocol and security tests
+test_mcp.py                       MCP protocol smoke test
+test_voice_assistant.py           message-loop safety tests
 ```
 
 ## Manual install
