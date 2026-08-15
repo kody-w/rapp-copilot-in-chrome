@@ -94,6 +94,20 @@ older = {
 }
 aged = {**older, "raw": "Aug 14\nsame message"}
 assert assistant.message_id(older) == assistant.message_id(aged)
+unlabelled_now = {
+    "direction": "inbound",
+    "from": "5558675309",
+    "body": "same message",
+    "raw": (
+        "10:30 PM\nMessage from , same message, Friday, August 14 2026, "
+        "10:30 PM.\nperson\nsame message"
+    ),
+}
+unlabelled_aged = {
+    **unlabelled_now,
+    "raw": unlabelled_now["raw"].replace("10:30 PM\n", "Aug 14\n", 1),
+}
+assert assistant.message_id(unlabelled_now) == assistant.message_id(unlabelled_aged)
 duplicate_one = {**older, "occurrence": 1}
 duplicate_two = {**older, "occurrence": 2}
 assert assistant.message_id(duplicate_one) != assistant.message_id(duplicate_two)
@@ -166,4 +180,4 @@ assert sent == [], "all first-run history must remain watermarked"
 large_state = json.loads(assistant.STATE_FILE.read_text())
 assert len(large_state["handled"]) == 600
 
-print("voice assistant: 27 safety assertions passed")
+print("voice assistant: 28 safety assertions passed")

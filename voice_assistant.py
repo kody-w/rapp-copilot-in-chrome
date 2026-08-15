@@ -89,9 +89,21 @@ def message_id(item):
     # stable, preventing yesterday's handled text from becoming new tomorrow.
     material = (
         f"{item['direction']}|{item['from']}|"
-        f"{item.get('label') or item['raw']}|{item.get('occurrence', 1)}"
+        f"{canonical_identity(item)}|{item.get('occurrence', 1)}"
     )
     return hashlib.sha256(material.encode()).hexdigest()[:20]
+
+
+def canonical_identity(item):
+    if item.get("identity"):
+        return item["identity"]
+    if item.get("label"):
+        return item["label"]
+    for line in str(item.get("raw") or "").splitlines():
+        line = line.strip()
+        if line.startswith("Message from "):
+            return line
+    return str(item.get("raw") or "")
 
 
 def eligible(item, cfg):

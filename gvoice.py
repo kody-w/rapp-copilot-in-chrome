@@ -306,7 +306,11 @@ def messages(c, tab):
           const label = [...node.querySelectorAll('[aria-label]')]
             .map(el => el.getAttribute('aria-label') || '')
             .find(value => value.includes('Message from ')) || '';
-          const signature = [outbound ? 'outbound' : 'inbound', label, body]
+          const declaration = raw.split('\\n')
+            .map(line => line.trim())
+            .find(line => line.startsWith('Message from ')) || '';
+          const identity = label || declaration || raw;
+          const signature = [outbound ? 'outbound' : 'inbound', identity, body]
             .join('|');
           const occurrence = (seen.get(signature) || 0) + 1;
           seen.set(signature, occurrence);
@@ -316,6 +320,7 @@ def messages(c, tab):
             from: outbound ? 'you' : (match?.[1] || '').replace(/\\s+/g, ''),
             body,
             label,
+            identity,
             occurrence,
             raw,
           };
