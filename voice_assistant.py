@@ -205,8 +205,20 @@ def log(line):
 
 
 def normalize_number(value):
-    digits = re.sub(r"\D", "", value or "")
-    return digits[-10:] if len(digits) >= 10 else digits
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not digits:
+        return ""
+    if raw.startswith("+"):
+        return f"+{digits}"
+    # This assistant is configured for Google Voice US numbers. Accept the two
+    # equivalent local spellings, then compare full E.164 exactly.
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    # Unknown international numbers are never collapsed to a US tail.
+    return f"+{digits}"
 
 
 def message_id(item):
@@ -340,11 +352,37 @@ def call_copilot(item, state, cfg):
         "off",
         "--no-color",
     ]
+    # Copilot can read process environment values without a shell/tool call.
+    # Pass only the few values required to locate its own auth/config. Never
+    # inherit tokens, cloud credentials, database URLs, or unrelated secrets.
+    allowed_env = (
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "SHELL",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "SSH_AUTH_SOCK",
+    )
+    clean_env = {
+        key: os.environ[key]
+        for key in allowed_env
+        if os.environ.get(key)
+    }
+    clean_env.setdefault("HOME", str(Path.home()))
+    clean_env.setdefault("PATH", os.defpath)
     result = subprocess.run(
         command,
         capture_output=True,
         text=True,
         timeout=180,
+        env=clean_env,
         # Never root an SMS prompt in a real repository. Even with zero tools,
         # repository instructions and filenames would enter the model context
         # before its first token.

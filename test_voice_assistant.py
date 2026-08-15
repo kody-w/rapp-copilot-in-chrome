@@ -111,6 +111,17 @@ unlabelled_aged = {
     "raw": unlabelled_now["raw"].replace("10:30 PM\n", "Aug 14\n", 1),
 }
 assert assistant.message_id(unlabelled_now) == assistant.message_id(unlabelled_aged)
+assert assistant.normalize_number("(555) 867-5309") == "+15558675309"
+assert assistant.normalize_number("+1 555 867 5309") == "+15558675309"
+assert assistant.normalize_number("+44 555 867 5309") == "+445558675309"
+assert not assistant.eligible(
+    {
+        "direction": "inbound",
+        "from": "+44 555 867 5309",
+        "body": "wrong country",
+    },
+    {"google_voice_peer": "+1 555 867 5309"},
+)
 duplicate_one = {**older, "occurrence": 1}
 duplicate_two = {**older, "occurrence": 2}
 assert assistant.message_id(duplicate_one) != assistant.message_id(duplicate_two)
@@ -139,6 +150,7 @@ original_run = subprocess.run
 def fake_run(command, **kwargs):
     captured["command"] = command
     captured["cwd"] = kwargs["cwd"]
+    captured["env"] = kwargs["env"]
     return subprocess.CompletedProcess(command, 0, stdout="Clean answer\n", stderr="")
 subprocess.run = fake_run
 try:
@@ -163,6 +175,9 @@ for flag in (
     assert flag in captured["command"]
 assert captured["command"][captured["command"].index("--stream") + 1] == "off"
 assert captured["cwd"].endswith(".rappter-chrome/chat-sandbox")
+assert "env" in captured
+assert "OPENAI_API_KEY" not in captured["env"]
+assert "RANDOM_TOKEN" not in captured["env"]
 
 assistant.STATE_FILE = tmp / "large-state.json"
 large_messages = [
@@ -264,4 +279,4 @@ with assistant.tick_lock() as acquired:
     thread.join(timeout=3)
 assert lock_results == [0]
 
-print("voice assistant: 39 safety assertions passed")
+print("voice assistant: 46 safety assertions passed")
