@@ -200,12 +200,34 @@ async function evalJs(tabId, code, awaitPromise) {
 }
 
 function waitForLoad(tabId, timeoutMs) {
-  return new Promise((resolve) => {
-    const done = () => { chrome.tabs.onUpdated.removeListener(fn); resolve(true); };
-    const fn = (id, info) => { if (id === tabId && info.status === "complete") done(); };
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => chrome.tabs.onUpdated.removeListener(fn);
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      resolve(true);
+    };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      cleanup();
+      reject(error);
+    };
+    const fn = (id, info) => {
+      if (id === tabId && info.status === "complete") done();
+    };
     chrome.tabs.onUpdated.addListener(fn);
-    chrome.tabs.get(tabId).then((t) => { if (t.status === "complete") done(); });
-    setTimeout(done, timeoutMs || 20000);
+    chrome.tabs.get(tabId)
+      .then((tab) => { if (tab.status === "complete") done(); })
+      .catch(fail);
+    const timer = setTimeout(
+      () => fail(new Error(`tab ${tabId} did not finish loading within ${timeoutMs || 20000}ms`)),
+      timeoutMs || 20000,
+    );
   });
 }
 

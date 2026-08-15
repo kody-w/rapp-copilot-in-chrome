@@ -97,13 +97,17 @@ browse local files or invoke machine tools.
 ### Verify
 
 ```bash
-python3 test_bridge.py           # RFC6455 + origin/token guards
-python3 test_mcp.py              # initialize + tool schemas
-python3 test_voice_assistant.py  # watermark, sender lock, dedupe, code filter
+python3 test_bridge.py           # 14 protocol/security checks
+python3 test_mcp.py              # initialize, 11 tools, batch translations
+python3 test_gvoice.py           # cold start and stale-thread refusal
+python3 test_voice_assistant.py  # 13 message-loop safety assertions
+python3 test_install_local.py    # malformed config cannot be overwritten
 ```
 
 The protocol suite covers 64-bit WebSocket frames with a 70KB payload, ping/pong, masking,
-error propagation, hostile web origins, and wrong tokens.
+pre-header disconnects, error propagation, hostile web origins, and wrong tokens. Voice tests
+also exercise inboxes larger than 500 messages so first-run history cannot be replayed after
+watermark truncation.
 
 ## Claude compatibility bridge
 
@@ -247,7 +251,9 @@ gvoice.py                         account-locked Google Voice browser driver
 voice_assistant.py                persistent, verified Copilot SMS loop
 test_bridge.py                    protocol and security tests
 test_mcp.py                       MCP protocol smoke test
+test_gvoice.py                    browser cold-start and DOM-settle tests
 test_voice_assistant.py           message-loop safety tests
+test_install_local.py             config-clobber regression test
 ```
 
 ## Manual install

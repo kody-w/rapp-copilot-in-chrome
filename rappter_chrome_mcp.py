@@ -155,6 +155,66 @@ NAME_TO_COMMAND = {
 }
 
 
+def batch_step(name, args):
+    """Translate an MCP tool call to the extension's command vocabulary."""
+    if name == "tabs_context_mcp":
+        return {"cmd": "tabs", "args": {}}
+    if name == "read_page":
+        if args.get("selector"):
+            return {
+                "cmd": "query",
+                "args": {
+                    "tabId": args["tabId"],
+                    "selector": args["selector"],
+                    "limit": args.get("limit", 40),
+                },
+            }
+        return {"cmd": "text", "args": {"tabId": args["tabId"]}}
+    if name == "form_input":
+        return {
+            "cmd": "type",
+            "args": {
+                "tabId": args["tabId"],
+                "selector": args["selector"],
+                "text": args["value"],
+                "submit": args.get("submit", False),
+            },
+        }
+    if name == "computer":
+        action = args["action"]
+        if action == "click":
+            command_args = {
+                "tabId": args["tabId"],
+                "selector": args["selector"],
+                "index": args.get("index", 0),
+            }
+        elif action == "type":
+            command_args = {
+                "tabId": args["tabId"],
+                "selector": args["selector"],
+                "text": args.get("text", ""),
+                "submit": args.get("submit", False),
+            }
+        elif action in ("activate", "screenshot"):
+            command_args = {"tabId": args["tabId"]}
+        else:
+            raise BridgeError(f"unsupported computer action in batch: {action}")
+        return {"cmd": action, "args": command_args}
+    if name == "list_connected_browsers":
+        return {"cmd": "ping", "args": {}}
+    if name == "browser_batch":
+        raise BridgeError("nested browser_batch is not supported")
+    command = NAME_TO_COMMAND.get(name)
+    if command:
+        if command == "eval":
+            return {
+                "cmd": "eval",
+                "args": {"tabId": args["tabId"], "code": args["code"]},
+            }
+        return {"cmd": command, "args": args}
+    raise BridgeError(f"unsupported tool in browser_batch: {name}")
+
+
 class Server:
     def __init__(self):
         self.chrome = None
@@ -219,20 +279,10 @@ class Server:
                 return chrome.screenshot(tab)
 
         if name == "browser_batch":
-            actions = []
-            for item in args["actions"]:
-                tool_name = item["name"]
-                tool_args = item["input"]
-                command = NAME_TO_COMMAND.get(tool_name, tool_name)
-                if command == "form_input":
-                    command = "type"
-                    tool_args = {
-                        "tabId": tool_args["tabId"],
-                        "selector": tool_args["selector"],
-                        "text": tool_args["value"],
-                        "submit": tool_args.get("submit", False),
-                    }
-                actions.append({"cmd": command, "args": tool_args})
+            actions = [
+                batch_step(item["name"], item["input"])
+                for item in args["actions"]
+            ]
             return chrome.batch(actions)
 
         if name == "list_connected_browsers":

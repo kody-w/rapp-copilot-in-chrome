@@ -182,7 +182,14 @@ class Chrome:
         # -- handshake --
         raw = b""
         while b"\r\n\r\n" not in raw:
-            raw += conn.recv(4096)
+            chunk = conn.recv(4096)
+            if not chunk:
+                conn.close()
+                raise BridgeError("peer closed during WebSocket handshake")
+            raw += chunk
+            if len(raw) > 64 * 1024:
+                conn.close()
+                raise BridgeError("WebSocket handshake exceeded 64KB")
         head = raw.decode("latin-1").split("\r\n")
         request = head[0]
         headers = {}
