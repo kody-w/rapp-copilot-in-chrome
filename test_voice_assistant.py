@@ -84,4 +84,14 @@ messages.append(
 assert assistant.tick(responder=responder, sender=sender) == 0
 assert len(sent) == 1
 
-print("voice assistant: 8 safety assertions passed")
+older = {
+    "direction": "inbound",
+    "from": "5558675309",
+    "body": "same message",
+    "label": "Message from 5 5 5, same message, Friday, August 14 2026, 10:30 PM.",
+    "raw": "10:30 PM\nsame message",
+}
+aged = {**older, "raw": "Aug 14\nsame message"}
+assert assistant.message_id(older) == assistant.message_id(aged)
+
+print("voice assistant: 9 safety assertions passed")
