@@ -15,14 +15,20 @@
 // SECURITY. This drives your real, logged-in browser, so the socket is not
 // open house:
 //   * the server binds 127.0.0.1 only — nothing off-box can reach it;
-//   * a shared token generated on the server, pasted in once here, must match;
+//   * mutual HMAC authentication proves both sides know the shared token
+//     without ever putting that token in the URL or sending it on the wire;
 //   * the server rejects any Origin that is not chrome-extension://, so a web
 //     page that guesses the port cannot drive your browser.
 // Any one of those alone would be thin. Together they mean an attacker needs
 // local code execution AND the token file, at which point they did not need
 // this extension.
 
-const DEFAULTS = { port: 8777, token: "" };
+const DEFAULTS = {
+  port: 8777,
+  token: "",
+  instanceId: "",
+  profileName: "",
+};
 const RETRY_MS = 2000;
 
 let ws = null;
@@ -48,26 +54,82 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 async function cfg() {
   const s = await chrome.storage.local.get(DEFAULTS);
-  return { port: s.port || DEFAULTS.port, token: s.token || "" };
+  let instanceId = s.instanceId || "";
+  if (!instanceId) {
+    instanceId = crypto.randomUUID();
+    await chrome.storage.local.set({ instanceId });
+  }
+  return {
+    port: s.port || DEFAULTS.port,
+    token: s.token || "",
+    instanceId,
+    profileName: s.profileName || "",
+  };
+}
+
+function randomNonce() {
+  const bytes = crypto.getRandomValues(new Uint8Array(24));
+  return toBase64Url(bytes);
+}
+
+function toBase64Url(bytes) {
+  let binary = "";
+  bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+  return btoa(binary).replaceAll("+", "-").replaceAll("/", "_").replace(/=+$/, "");
+}
+
+async function proof(token, message) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(token),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  return toBase64Url(new Uint8Array(
+    await crypto.subtle.sign("HMAC", key, encoder.encode(message)),
+  ));
+}
+
+function sameString(left, right) {
+  if (typeof left !== "string" || typeof right !== "string"
+      || left.length !== right.length) return false;
+  let different = 0;
+  for (let i = 0; i < left.length; i++) {
+    different |= left.charCodeAt(i) ^ right.charCodeAt(i);
+  }
+  return different === 0;
 }
 
 async function ensureConnected() {
   if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
   if (connecting) return;
-  const { port, token } = await cfg();
+  const { port, token, instanceId, profileName } = await cfg();
   if (!token) return;                      // unconfigured is OFF, not open
   connecting = true;
   try {
-    const sock = new WebSocket(`ws://127.0.0.1:${port}/?token=${encodeURIComponent(token)}`);
+    const auth = {
+      authenticated: false,
+      clientNonce: randomNonce(),
+      instanceId,
+    };
+    const sock = new WebSocket(`ws://127.0.0.1:${port}/`);
     sock.onopen = () => {
       ws = sock;
       connecting = false;
-      setStatus("connected");
-      sock.send(JSON.stringify({ hello: "rappter-chrome", version: 1 }));
+      setStatus("authenticating");
+      sock.send(JSON.stringify({
+        hello: "rappter-chrome",
+        version: 2,
+        clientNonce: auth.clientNonce,
+        instanceId,
+        profileName,
+      }));
     };
     sock.onclose = () => { ws = null; connecting = false; setStatus("waiting"); };
     sock.onerror = () => { connecting = false; };
-    sock.onmessage = (ev) => handleMessage(sock, ev.data);
+    sock.onmessage = (ev) => handleMessage(sock, ev.data, auth, token);
   } catch (e) {
     connecting = false;
   }
@@ -77,9 +139,35 @@ function setStatus(s) { chrome.storage.local.set({ status: s, statusAt: Date.now
 setInterval(ensureConnected, RETRY_MS);
 ensureConnected();
 
-async function handleMessage(sock, raw) {
+async function handleMessage(sock, raw, auth, token) {
   let msg;
   try { msg = JSON.parse(raw); } catch { return; }
+  if (!auth.authenticated) {
+    const serverNonce = msg && msg.authChallenge;
+    if (typeof serverNonce !== "string" || typeof msg.serverProof !== "string") {
+      sock.close(4003, "authentication required");
+      return;
+    }
+    const expected = await proof(
+      token,
+      `server:${auth.clientNonce}:${serverNonce}:${auth.instanceId}`,
+    );
+    if (!sameString(expected, msg.serverProof)) {
+      sock.close(4003, "server authentication failed");
+      return;
+    }
+    const clientProof = await proof(
+      token,
+      `client:${auth.clientNonce}:${serverNonce}:${auth.instanceId}`,
+    );
+    sock.send(JSON.stringify({
+      authResponse: clientProof,
+      instanceId: auth.instanceId,
+    }));
+    auth.authenticated = true;
+    setStatus("connected");
+    return;
+  }
   const { id, cmd, args } = msg;
   try {
     const result = await dispatch(cmd, args || {});
@@ -235,6 +323,12 @@ async function dispatch(cmd, a) {
   switch (cmd) {
     case "ping":
       return { pong: true, at: Date.now() };
+
+    case "reload_extension":
+      // Reply first so the installer can prove the command arrived, then
+      // replace this service worker with the newly installed files.
+      setTimeout(() => chrome.runtime.reload(), 100);
+      return { reloading: true };
 
     case "tabs": {
       const tabs = await chrome.tabs.query({});

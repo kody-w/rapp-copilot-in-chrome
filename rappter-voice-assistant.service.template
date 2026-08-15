@@ -1,0 +1,14 @@
+[Unit]
+Description=Rappter Google Voice assistant
+After=graphical-session.target network-online.target
+
+[Service]
+Type=simple
+Environment=HOME=__HOME__
+WorkingDirectory=__RUNTIME__
+ExecStart=__PYTHON__ __RUNTIME__/voice_assistant.py --loop --interval 60
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

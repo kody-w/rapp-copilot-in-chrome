@@ -46,6 +46,7 @@ thing that can be missing at 3am.
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import secrets
@@ -59,6 +60,7 @@ from pathlib import Path
 
 CONF_DIR = Path.home() / ".rappter-chrome"
 TOKEN_FILE = CONF_DIR / "token"
+CONFIG_FILE = CONF_DIR / "config.json"
 DEFAULT_PORT = 8777
 GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -96,6 +98,26 @@ def token(create=True):
 
 class BridgeError(RuntimeError):
     pass
+
+
+def preferred_instance():
+    from_env = os.environ.get("RAPPTER_CHROME_INSTANCE", "").strip()
+    if from_env:
+        return from_env
+    try:
+        config = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return str(config.get("browser_instance") or "").strip()
+    except Exception:
+        return ""
+
+
+def _proof(shared_token, message):
+    digest = hmac.new(
+        shared_token.encode(),
+        message.encode(),
+        hashlib.sha256,
+    ).digest()
+    return base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 
 # ── minimal RFC6455 server ──────────────────────────────────────────────────
@@ -161,13 +183,23 @@ def _send_frame(sock, payload, opcode=0x1):
 class Chrome:
     """A one-shot bridge session. Use as a context manager."""
 
-    def __init__(self, port=DEFAULT_PORT, wait=30, timeout=60, verbose=False):
+    def __init__(
+        self,
+        port=DEFAULT_PORT,
+        wait=30,
+        timeout=60,
+        verbose=False,
+        instance=None,
+    ):
         self.port = port
         self.wait = wait
         self.timeout = timeout
         self.verbose = verbose
+        self.instance = preferred_instance() if instance is None else instance
         self.srv = None
         self.conn = None
+        self.hello = None
+        self.instance_id = None
         self._id = 0
 
     # -- lifecycle --
@@ -203,18 +235,53 @@ class Chrome:
         self.srv.listen(1)
         self.srv.settimeout(max(0.1, deadline - time.monotonic()))
 
-        try:
-            conn, _ = self.srv.accept()
-        except socket.timeout:
-            raise BridgeError(
-                f"no extension dialled in within {self.wait}s.\n"
-                "  - is the extension loaded at chrome://extensions (Developer mode)?\n"
-                "  - does its popup show the same port and token?\n"
-                f"  - token: {expected}")
-        conn.settimeout(self.timeout)
-        self.conn = conn
+        last_error = None
+        while time.monotonic() < deadline:
+            self.srv.settimeout(max(0.1, deadline - time.monotonic()))
+            try:
+                conn, _ = self.srv.accept()
+            except socket.timeout:
+                break
+            conn.settimeout(self.timeout)
+            try:
+                hello = self._authenticate(conn, expected)
+            except BridgeError as exc:
+                last_error = exc
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            instance_id = str(hello.get("instanceId") or "")
+            if self.instance and instance_id != self.instance:
+                last_error = BridgeError(
+                    f"extension instance {instance_id or '(unknown)'} does not "
+                    f"match configured instance {self.instance}"
+                )
+                try:
+                    _send_frame(conn, b"", opcode=0x8)
+                    conn.close()
+                except OSError:
+                    pass
+                continue
+            self.conn = conn
+            self.hello = hello
+            self.instance_id = instance_id
+            if self.verbose:
+                print(f"# connected: {hello}", file=sys.stderr)
+            return self
+        detail = f" Last refusal: {last_error}" if last_error else ""
+        raise BridgeError(
+            f"no authenticated extension dialled in within {self.wait}s.\n"
+            "  - is the extension loaded at edge://extensions or "
+            "chrome://extensions?\n"
+            "  - does its popup show the same token and port?\n"
+            f"  - configured instance: {self.instance or '(any)'}."
+            f"{detail}"
+        )
 
-        # -- handshake --
+    def _authenticate(self, conn, expected):
+        # -- WebSocket handshake --
         raw = b""
         while b"\r\n\r\n" not in raw:
             chunk = conn.recv(4096)
@@ -241,22 +308,53 @@ class Chrome:
             self._reject(conn, "403 Forbidden")
             raise BridgeError(f"refused non-extension origin: {origin!r}")
 
-        qs = urllib.parse.urlparse(request.split(" ")[1] if " " in request else "/").query
-        supplied = urllib.parse.parse_qs(qs).get("token", [""])[0]
-        if not secrets.compare_digest(supplied, expected):
-            self._reject(conn, "401 Unauthorized")
-            raise BridgeError("extension supplied the wrong token")
-
         key = headers.get("sec-websocket-key", "")
         conn.sendall(
             b"HTTP/1.1 101 Switching Protocols\r\n"
             b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
             b"Sec-WebSocket-Accept: " + _accept_key(key).encode() + b"\r\n\r\n")
 
-        hello = self._recv_json()          # the extension announces itself
-        if self.verbose:
-            print(f"# connected: {hello}", file=sys.stderr)
-        return self
+        hello = self._recv_json_from(conn)
+        if (
+            not isinstance(hello, dict)
+            or hello.get("hello") != "rappter-chrome"
+            or hello.get("version") != 2
+            or not isinstance(hello.get("clientNonce"), str)
+            or not isinstance(hello.get("instanceId"), str)
+        ):
+            raise BridgeError("extension sent an invalid authentication hello")
+
+        client_nonce = hello["clientNonce"]
+        instance_id = hello["instanceId"]
+        server_nonce = secrets.token_urlsafe(24)
+        server_proof = _proof(
+            expected,
+            f"server:{client_nonce}:{server_nonce}:{instance_id}",
+        )
+        _send_frame(
+            conn,
+            json.dumps(
+                {
+                    "authChallenge": server_nonce,
+                    "serverProof": server_proof,
+                }
+            ),
+        )
+        response = self._recv_json_from(conn)
+        wanted = _proof(
+            expected,
+            f"client:{client_nonce}:{server_nonce}:{instance_id}",
+        )
+        if (
+            not isinstance(response, dict)
+            or response.get("instanceId") != instance_id
+            or not secrets.compare_digest(
+                str(response.get("authResponse") or ""),
+                wanted,
+            )
+        ):
+            raise BridgeError("extension mutual authentication failed")
+        return hello
 
     def _reject(self, conn, status):
         try:
@@ -276,12 +374,15 @@ class Chrome:
 
     # -- protocol --
     def _recv_json(self):
+        return self._recv_json_from(self.conn)
+
+    def _recv_json_from(self, conn):
         while True:
-            op, data = _read_frame(self.conn)
+            op, data = _read_frame(conn)
             if op == 0x8:
                 raise BridgeError("extension closed the connection")
             if op == 0x9:                              # ping -> pong
-                _send_frame(self.conn, data, opcode=0xA)
+                _send_frame(conn, data, opcode=0xA)
                 continue
             if op == 0xA:
                 continue
@@ -291,8 +392,8 @@ class Chrome:
         self._id += 1
         mid = self._id
         _send_frame(self.conn, json.dumps({"id": mid, "cmd": cmd, "args": args}))
-        deadline = time.time() + self.timeout
-        while time.time() < deadline:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
             msg = self._recv_json()
             if msg.get("id") != mid:
                 continue
@@ -353,8 +454,13 @@ def main():
         return 0
 
     try:
-        with Chrome(verbose=True) as c:
-            if cmd == "ping":
+        with Chrome(
+            verbose=True,
+            instance="" if cmd == "identity" else None,
+        ) as c:
+            if cmd == "identity":
+                print(json.dumps(c.hello, indent=2))
+            elif cmd == "ping":
                 print(json.dumps(c.ping()))
             elif cmd == "tabs":
                 for t in c.tabs():

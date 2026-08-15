@@ -58,6 +58,16 @@ extensions page.
 The popup says **waiting for a local server** while idle. That is healthy: the MCP server is
 one-shot and exists only while Copilot is using browser tools.
 
+Upgrades are transactional: runtime, extension, skill, and MCP config are staged and journaled,
+then swapped atomically. An interrupted process or power loss restores the coherent previous
+generation on the next installer run. An already configured extension reloads itself, and an
+active Voice service is stopped before the swap and restarted afterwards.
+
+Each browser profile receives a persistent instance ID, visible in the popup and with
+`python3 bridge.py identity`. Set `browser_instance` in `~/.rappter-chrome/config.json` on
+multi-profile machines; every other profile is rejected instead of racing whichever connects
+first.
+
 ### The 11 local tools
 
 `tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`, `navigate`, `get_page_text`,
@@ -77,8 +87,10 @@ This drives a real authenticated profile. Three independent guards protect the s
 - a random 192-bit token stored mode `0600`;
 - the WebSocket `Origin` must begin `chrome-extension://`.
 
-A web page that guesses the port receives `403 Forbidden` before the WebSocket upgrade. A client
-with the wrong token receives `401 Unauthorized`. Both are protocol-tested.
+A web page that guesses the port receives `403 Forbidden` before the WebSocket upgrade. The token
+is never placed in the URL or sent on the wire: client and server prove possession with fresh
+nonces and directional HMAC-SHA256 proofs. A hostile local process can occupy the port and cause
+denial of service, but cannot authenticate as the server or issue browser commands.
 
 ### Google Voice and persistent Copilot chat
 
@@ -87,28 +99,49 @@ as an outgoing message. `voice_assistant.py` locks both the Google account and p
 `~/.rappter-chrome/config.json`, watermarks existing history on first run, and uses:
 
 ```
-read inbound -> ask Copilot with zero tools -> send -> confirm -> mark handled
+read inbound -> ask Copilot with zero tools -> persist intent
+             -> send -> confirm by readback -> mark handled
 ```
 
-Model generation or delivery failure leaves the message unhandled for retry. The assistant runs
-Copilot in an empty sandbox with `--available-tools=` and built-in MCPs disabled, so an SMS cannot
-browse local files or invoke machine tools.
+If the process dies after delivery but before final state save, the next tick compares the
+outgoing count to the durable pre-send baseline and finalizes without sending twice. State uses
+unique atomic temp files, directory fsync, a known-good backup, and a process lock. The assistant
+runs Copilot silently in an empty sandbox with no tools, no built-in MCPs, and no repository
+instructions; transcript text is encoded as untrusted JSON and Unicode controls are stripped.
+
+Example machine-local config (keep it mode `0600`):
+
+```json
+{
+  "browser_instance": "copy from: python3 bridge.py identity",
+  "google_voice_account": "account@example.com",
+  "google_voice_url": "https://voice.google.com/u/1/messages",
+  "google_voice_peer": "5558675309",
+  "google_voice_owner": "Owner",
+  "google_voice_model": "gpt-5.6-sol",
+  "max_replies_per_hour": 6
+}
+```
+
+macOS uses the included LaunchAgent template. Linux installs include a systemd user-service
+template; active services are detected and restarted during upgrades.
 
 ### Verify
 
 ```bash
-python3 test_bridge.py           # 17 protocol/security/concurrency checks
+python3 test_bridge.py           # 19 protocol/security/profile checks
 python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translations
 python3 test_gvoice.py           # cold start and stale-thread refusal
-python3 test_voice_assistant.py  # 28 injection, identity, watermark assertions
-python3 test_install_local.py    # config, concurrency, and rollback safety
+python3 test_voice_assistant.py  # 39 crash, injection, identity assertions
+python3 test_install_local.py    # config, concurrency, rollback, SIGKILL recovery
 ```
 
 The protocol suite covers 64-bit WebSocket frames with a 70KB payload, ping/pong, masking,
-pre-header disconnects, malformed JSON/UTF-8 recovery, hostile web origins, and wrong tokens.
-Voice tests exercise inboxes larger than 500 messages, same-time duplicate text, prompt/control
-injection, and unsafe action-claim filtering. Installer tests exercise concurrent processes and
-rollback after an injected mid-transaction failure.
+pre-header disconnects, malformed JSON/UTF-8 recovery, hostile web origins, HMAC authentication,
+and deterministic profile selection. Voice tests exercise inboxes larger than 500 messages,
+same-time duplicate text, send/crash recovery, corrupt-state recovery, prompt/control injection,
+and unsafe action-claim filtering. Installer tests exercise concurrent processes, rollback after
+an injected failure, and journal recovery after SIGKILL.
 
 ## Claude compatibility bridge
 
@@ -250,6 +283,8 @@ bridge.py                         zero-dependency localhost WebSocket transport
 rappter_chrome_mcp.py             11-tool stdio MCP server
 gvoice.py                         account-locked Google Voice browser driver
 voice_assistant.py                persistent, verified Copilot SMS loop
+com.rapp.voice-assistant.plist.template  macOS resident service
+rappter-voice-assistant.service.template Linux user service
 test_bridge.py                    protocol and security tests
 test_mcp.py                       MCP protocol smoke test
 test_gvoice.py                    browser cold-start and DOM-settle tests
