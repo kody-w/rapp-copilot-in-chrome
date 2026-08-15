@@ -18,6 +18,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -159,14 +160,42 @@ def _extension_installed():
     return False
 
 
-def _read_mcp_config():
+def _read_mcp_config(strict=False):
     if not os.path.exists(MCP_CONFIG):
         return {}
     try:
         with open(MCP_CONFIG, "r", encoding="utf-8") as fh:
             return json.load(fh)
     except (ValueError, OSError):
+        if strict:
+            raise ValueError(
+                "refusing to overwrite unreadable MCP config: %s" % MCP_CONFIG
+            )
         return {}
+
+
+def _write_mcp_config(cfg):
+    """Write config atomically and keep OAuth/server metadata private."""
+    os.makedirs(COPILOT_DIR, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".mcp-config.",
+        suffix=".json",
+        dir=COPILOT_DIR,
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2)
+            fh.write("\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, MCP_CONFIG)
+        os.chmod(MCP_CONFIG, 0o600)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def _probe(timeout=45, live=False):
@@ -256,13 +285,10 @@ def _do_install(skill_src_dir):
     os.chmod(BIN_PATH, 0o755)
     steps.append("wrote launcher %s" % BIN_PATH)
 
-    cfg = _read_mcp_config()
+    cfg = _read_mcp_config(strict=True)
     cfg.setdefault("mcpServers", {})[SERVER_NAME] = {
         "type": "local", "command": BIN_PATH, "args": [], "tools": ["*"]}
-    os.makedirs(COPILOT_DIR, exist_ok=True)
-    with open(MCP_CONFIG, "w", encoding="utf-8") as fh:
-        json.dump(cfg, fh, indent=2)
-        fh.write("\n")
+    _write_mcp_config(cfg)
     steps.append("registered MCP server '%s' in %s" % (SERVER_NAME, MCP_CONFIG))
 
     if skill_src_dir and os.path.isdir(skill_src_dir):
@@ -281,11 +307,9 @@ def _do_install(skill_src_dir):
 
 def _do_uninstall():
     steps = []
-    cfg = _read_mcp_config()
+    cfg = _read_mcp_config(strict=True)
     if cfg.get("mcpServers", {}).pop(SERVER_NAME, None) is not None:
-        with open(MCP_CONFIG, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2)
-            fh.write("\n")
+        _write_mcp_config(cfg)
         steps.append("unregistered MCP server '%s'" % SERVER_NAME)
     if os.path.exists(BIN_PATH):
         os.remove(BIN_PATH)
@@ -365,7 +389,7 @@ class RappCopilotInChromeAgent(BasicAgent):
         if action == "install":
             try:
                 steps = _do_install(skill_dir)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 return json.dumps({"status": "error", "message": "install failed: %s" % exc})
 
         claude = _claude_bin()

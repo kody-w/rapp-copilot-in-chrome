@@ -11,7 +11,7 @@ import base64, hashlib, json, os, socket, struct, sys, threading, time
 import tempfile
 from pathlib import Path
 
-sys.path.insert(0, str(Path.home() / "Documents/GitHub/rappter-chrome"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bridge
 
 PASS, FAIL = [], []
