@@ -50,9 +50,11 @@ The installer copies a portable runtime and extension to `~/.rappter-chrome`, ge
 machine-local token, registers `rappter-chrome-local` in Copilot's MCP config, and opens the
 extensions page.
 
-1. Enable **Developer mode**.
+1. Open `edge://extensions/` or `chrome://extensions/`, then enable
+   **Developer mode**.
 2. Choose **Load unpacked** and select `~/.rappter-chrome/extension`.
-3. Open the extension popup and paste the token printed by the installer.
+3. Open the extension popup, paste the token printed by the installer, and
+   click **Save & connect**.
 4. Restart Copilot CLI.
 
 The popup says **waiting for a local server** while idle. That is healthy: the MCP server is
@@ -64,7 +66,8 @@ generation on the next installer run. An already configured extension reloads it
 active Voice service is stopped before the swap and restarted afterwards.
 
 Each browser profile receives a persistent instance ID, visible in the popup and with
-`python3 bridge.py identity`. Set `browser_instance` in `~/.rappter-chrome/config.json` on
+`python3 ~/.rappter-chrome/runtime/bridge.py identity`. Set `browser_instance` in
+`~/.rappter-chrome/config.json` on
 multi-profile machines; every other profile is rejected instead of racing whichever connects
 first.
 
@@ -113,7 +116,7 @@ Example machine-local config (keep it mode `0600`):
 
 ```json
 {
-  "browser_instance": "copy from: python3 bridge.py identity",
+  "browser_instance": "copy from: python3 ~/.rappter-chrome/runtime/bridge.py identity",
   "google_voice_account": "account@example.com",
   "google_voice_url": "https://voice.google.com/u/1/messages",
   "google_voice_peer": "5558675309",
@@ -129,6 +132,7 @@ template; active services are detected and restarted during upgrades.
 ### Verify
 
 ```bash
+cd ~/.rappter-chrome/runtime
 python3 test_bridge.py           # 19 protocol/security/profile checks
 python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translations
 python3 test_gvoice.py           # cold start and stale-thread refusal

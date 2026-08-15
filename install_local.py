@@ -34,6 +34,13 @@ RUNTIME_FILES = [
     "com.rapp.voice-assistant.plist.template",
     "rappter-voice-assistant.service.template",
 ]
+TEST_FILES = [
+    "test_bridge.py",
+    "test_mcp.py",
+    "test_gvoice.py",
+    "test_voice_assistant.py",
+    "test_install_local.py",
+]
 
 
 def load_json(path, default):
@@ -312,7 +319,7 @@ def reload_extensions(bridge_module, window=6):
 
 
 def install(args):
-    for name in RUNTIME_FILES:
+    for name in RUNTIME_FILES + TEST_FILES:
         if not (SOURCE / name).is_file():
             raise RuntimeError(f"missing runtime source: {SOURCE / name}")
     if not (SOURCE / "extension").is_dir():
@@ -353,7 +360,7 @@ def install(args):
     }
 
     try:
-        for name in RUNTIME_FILES:
+        for name in RUNTIME_FILES + TEST_FILES:
             source = SOURCE / name
             destination = runtime_stage / name
             if name.endswith((".plist.template", ".service.template")):
@@ -484,6 +491,11 @@ def install(args):
             ["open", "-a", browser, "edge://extensions/" if "Edge" in browser else "chrome://extensions/"],
             check=False,
         )
+        extensions_url = (
+            "edge://extensions/" if "Edge" in browser else "chrome://extensions/"
+        )
+    else:
+        extensions_url = "chrome://extensions/ (or edge://extensions/)"
 
     print("Installed vendorless Rappter browser bridge")
     print(f"  extension: {EXTENSION}")
@@ -499,8 +511,16 @@ def install(args):
     if not args.keep_legacy:
         print("  legacy:    Anthropic launcher/config removed")
     print()
-    print("Load the extension folder as unpacked, paste the token in its popup,")
-    print("then restart Copilot CLI. No Claude binary or vendor login is used.")
+    print(f"Open {extensions_url}")
+    print("Enable Developer mode, load the extension folder as unpacked,")
+    print("paste the token in its popup, then click Save & connect.")
+    print("Restart Copilot CLI after setup. No Claude binary or vendor login is used.")
+    print()
+    print("Installed commands:")
+    print(f"  python3 {RUNTIME / 'bridge.py'} identity")
+    print(f"  python3 {RUNTIME / 'bridge.py'} tabs")
+    print(f"  python3 {RUNTIME / 'gvoice.py'} probe")
+    print(f"  python3 {RUNTIME / 'voice_assistant.py'} --reply-latest")
     return 0
 
 
