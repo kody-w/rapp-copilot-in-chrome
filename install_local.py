@@ -29,6 +29,8 @@ CONFIG_BACKUP = ROOT / ".mcp-config.install-backup"
 RUNTIME_FILES = [
     "bridge.py",
     "gvoice.py",
+    "install-local.sh",
+    "install_local.py",
     "rappter_chrome_mcp.py",
     "voice_assistant.py",
     "com.rapp.voice-assistant.plist.template",
@@ -375,14 +377,27 @@ def install(args):
                 shutil.copy2(source, destination)
             os.chmod(
                 destination,
-                0o700 if name.endswith(".py") else 0o600,
+                0o700 if name.endswith((".py", ".sh")) else 0o600,
             )
         for item in (SOURCE / "extension").iterdir():
             if item.is_file():
                 shutil.copy2(item, extension_stage / item.name)
+                # Keep the installed runtime self-contained: install_local.py
+                # and its regression test must work after a curl install, when
+                # the source checkout and temporary download no longer exist.
+                (runtime_stage / "extension").mkdir(exist_ok=True)
+                shutil.copy2(
+                    item,
+                    runtime_stage / "extension" / item.name,
+                )
         shutil.copy2(
             SOURCE / "local-skill" / "SKILL.md",
             skill_stage / "SKILL.md",
+        )
+        (runtime_stage / "local-skill").mkdir(exist_ok=True)
+        shutil.copy2(
+            SOURCE / "local-skill" / "SKILL.md",
+            runtime_stage / "local-skill" / "SKILL.md",
         )
         for stage in stages:
             fsync_tree(stage)
