@@ -2,10 +2,14 @@
 # Install the vendorless local Edge/Chrome bridge.
 set -eu
 
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "rappter-chrome: python3 is required (3.9+)." >&2
+  exit 1
+fi
+
 HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ -f "$HERE/install_local.py" ]; then
-  python3 "$HERE/install_local.py" "$@"
-  exit $?
+  exec python3 "$HERE/install_local.py" "$@"
 fi
 
 TMP=$(mktemp -d)
