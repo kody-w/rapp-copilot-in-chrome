@@ -64,6 +64,9 @@ Upgrades are transactional: runtime, extension, skill, and MCP config are staged
 then swapped atomically. An interrupted process or power loss restores the coherent previous
 generation on the next installer run. An already configured extension reloads itself, and an
 active Voice service is stopped before the swap and restarted afterwards.
+The installed runtime also carries the installer entry points, extension/skill
+source, and regression tests, so diagnostics and future self-upgrades do not
+depend on the original clone or curl temporary directory still existing.
 
 Each browser profile receives a persistent instance ID, visible in the popup and with
 `python3 ~/.rappter-chrome/runtime/bridge.py identity`. Set `browser_instance` in
