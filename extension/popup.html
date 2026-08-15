@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+  body { font: 13px -apple-system, system-ui, sans-serif; width: 300px; padding: 14px; margin: 0; }
+  h1 { font-size: 14px; margin: 0 0 10px; }
+  label { display: block; margin: 10px 0 4px; color: #555; font-size: 12px; }
+  input { width: 100%; box-sizing: border-box; padding: 6px; font-family: ui-monospace, monospace; font-size: 12px; }
+  button { margin-top: 12px; padding: 6px 12px; width: 100%; }
+  .status { margin-top: 12px; padding: 8px; border-radius: 5px; font-weight: 600; text-align: center; }
+  .connected { background: #e5f6e5; color: #12621a; }
+  .waiting   { background: #fdf3d8; color: #7a5c00; }
+  .off       { background: #f0f0f0; color: #666; }
+  .hint { color: #777; font-size: 11px; margin-top: 10px; line-height: 1.45; }
+  code { background: #f2f2f2; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+  <h1>Rappter Chrome Bridge</h1>
+  <div id="status" class="status off">not configured</div>
+
+  <label>Port</label>
+  <input id="port" type="number" value="8777">
+
+  <label>Token</label>
+  <input id="token" type="text" placeholder="paste from ~/.rappter-chrome/token">
+
+  <button id="save">Save &amp; connect</button>
+
+  <div class="hint">
+    Get the token with:<br>
+    <code>python3 bridge.py token</code><br><br>
+    An empty token means the bridge is <b>off</b> — it will not connect to anything.
+  </div>
+
+<script src="popup.js"></script>
+</body>
+</html>

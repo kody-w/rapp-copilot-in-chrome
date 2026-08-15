@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.rapp.voice-assistant</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__RUNTIME__/voice_assistant.py</string>
+    <string>--loop</string>
+    <string>--interval</string>
+    <string>60</string>
+  </array>
+  <!--
+    KeepAlive rather than StartInterval. On this machine launchd leaves
+    nondemand jobs permanently "pended" while reporting them loaded and healthy.
+    The Python process owns its 60-second loop; launchd only keeps it resident.
+  -->
+  <key>KeepAlive</key><true/>
+  <key>RunAtLoad</key><true/>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>ProcessType</key><string>Standard</string>
+  <key>WorkingDirectory</key><string>__RUNTIME__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key><string>__HOME__</string>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:__HOME__/.local/bin</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.rappter-chrome/voice-assistant.stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.rappter-chrome/voice-assistant.stderr.log</string>
+</dict>
+</plist>

@@ -1,0 +1,24 @@
+{
+  "manifest_version": 3,
+  "name": "Rappter Chrome Bridge",
+  "version": "1.0.0",
+  "description": "Drive this browser from local scripts over a localhost WebSocket. No native messaging host, no vendor account.",
+
+  "permissions": [
+    "tabs",
+    "scripting",
+    "storage",
+    "alarms",
+    "debugger"
+  ],
+  "host_permissions": ["<all_urls>"],
+
+  "background": {
+    "service_worker": "background.js"
+  },
+
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Rappter Chrome Bridge"
+  }
+}
