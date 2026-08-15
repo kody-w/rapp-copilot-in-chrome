@@ -144,6 +144,7 @@ TOOLS = [
         "inputSchema": {"type": "object", "properties": {}},
     },
 ]
+TOOL_NAMES = {tool["name"] for tool in TOOLS}
 
 
 NAME_TO_COMMAND = {
@@ -231,6 +232,31 @@ class Server:
         self.chrome = None
 
     def call(self, name, args):
+        if name not in TOOL_NAMES:
+            raise BridgeError(f"unknown tool: {name}")
+
+        # Translate and validate before opening the browser channel. Invalid
+        # tool calls must fail immediately rather than waiting 35 seconds for
+        # an extension connection they can never use.
+        translated_batch = None
+        if name == "browser_batch":
+            actions = args.get("actions")
+            if not isinstance(actions, list):
+                raise BridgeError("browser_batch.actions must be an array")
+            translated_batch = []
+            for item in actions:
+                if not isinstance(item, dict):
+                    raise BridgeError("browser_batch action must be an object")
+                tool_name = item.get("name")
+                tool_input = item.get("input")
+                if not isinstance(tool_name, str) or not isinstance(
+                    tool_input, dict
+                ):
+                    raise BridgeError(
+                        "browser_batch action requires string name and object input"
+                    )
+                translated_batch.append(batch_step(tool_name, tool_input))
+
         chrome = self.connection()
 
         if name == "tabs_context_mcp":
@@ -279,11 +305,7 @@ class Server:
                 return chrome.screenshot(tab)
 
         if name == "browser_batch":
-            actions = [
-                batch_step(item["name"], item["input"])
-                for item in args["actions"]
-            ]
-            return chrome.batch(actions)
+            return chrome.batch(translated_batch)
 
         if name == "list_connected_browsers":
             return [{"name": "local Chromium", "connected": True}]
@@ -293,7 +315,7 @@ class Server:
             if command == "eval":
                 return chrome.eval(args["tabId"], args["code"])
             return chrome.call(command, **args)
-        raise BridgeError(f"unknown tool: {name}")
+        raise BridgeError(f"unsupported tool: {name}")
 
 
 def text_result(value, is_error=False):
@@ -304,57 +326,90 @@ def text_result(value, is_error=False):
     return result
 
 
+def rpc_error(request_id, code, message):
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": message},
+    }
+
+
+def rpc_result(request_id, result):
+    return {"jsonrpc": "2.0", "id": request_id, "result": result}
+
+
+def emit(message):
+    sys.stdout.write(json.dumps(message) + "\n")
+    sys.stdout.flush()
+
+
+def handle(server, request):
+    if not isinstance(request, dict) or request.get("jsonrpc") != "2.0":
+        return rpc_error(None, -32600, "Invalid Request")
+    if not isinstance(request.get("method"), str):
+        return rpc_error(request.get("id"), -32600, "Invalid Request")
+
+    notification = "id" not in request
+    request_id = request.get("id")
+    method = request["method"]
+    params = request.get("params", {})
+    if not isinstance(params, dict):
+        return None if notification else rpc_error(
+            request_id, -32602, "Invalid params"
+        )
+
+    if method in ("notifications/initialized", "notifications/cancelled"):
+        return None
+    if method == "initialize":
+        result = {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {
+                "name": "rappter-chrome-local",
+                "version": "1.0.0",
+            },
+        }
+    elif method == "tools/list":
+        result = {"tools": TOOLS}
+    elif method == "ping":
+        result = {}
+    elif method == "tools/call":
+        name = params.get("name")
+        arguments = params.get("arguments", {})
+        if not isinstance(name, str) or not isinstance(arguments, dict):
+            return None if notification else rpc_error(
+                request_id, -32602, "Invalid params"
+            )
+        try:
+            result = text_result(server.call(name, arguments))
+        except BridgeError as exc:
+            server.reset()
+            result = text_result(str(exc), is_error=True)
+        except Exception:
+            server.reset()
+            print("unexpected browser tool failure", file=sys.stderr)
+            result = text_result("Internal browser tool error", is_error=True)
+    else:
+        return None if notification else rpc_error(
+            request_id, -32601, "Method not found"
+        )
+
+    return None if notification else rpc_result(request_id, result)
+
+
 def main():
     server = Server()
     try:
-        for line in sys.stdin:
+        for raw in sys.stdin.buffer:
             try:
+                line = raw.decode("utf-8")
                 request = json.loads(line)
-            except ValueError:
+            except (UnicodeDecodeError, ValueError):
+                emit(rpc_error(None, -32700, "Parse error"))
                 continue
-            request_id = request.get("id")
-            method = request.get("method")
-            if request_id is None:
-                continue
-
-            if method == "initialize":
-                result = {
-                    "protocolVersion": "2025-06-18",
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {
-                        "name": "rappter-chrome-local",
-                        "version": "1.0.0",
-                    },
-                }
-            elif method == "tools/list":
-                result = {"tools": TOOLS}
-            elif method == "ping":
-                result = {}
-            elif method == "tools/call":
-                params = request.get("params", {})
-                try:
-                    result = text_result(
-                        server.call(
-                            params.get("name", ""),
-                            params.get("arguments", {}),
-                        )
-                    )
-                except Exception as exc:
-                    # A broken browser session is not reusable. The next call
-                    # gets a fresh listener and a fresh extension connection.
-                    server.reset()
-                    result = text_result(
-                        f"{type(exc).__name__}: {exc}",
-                        is_error=True,
-                    )
-            else:
-                result = text_result(f"unknown method: {method}", is_error=True)
-
-            sys.stdout.write(
-                json.dumps({"jsonrpc": "2.0", "id": request_id, "result": result})
-                + "\n"
-            )
-            sys.stdout.flush()
+            response = handle(server, request)
+            if response is not None:
+                emit(response)
     finally:
         server.reset()
     return 0

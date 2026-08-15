@@ -52,6 +52,7 @@ import secrets
 import socket
 import struct
 import sys
+import tempfile
 import time
 import urllib.parse
 from pathlib import Path
@@ -64,14 +65,33 @@ GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
 def token(create=True):
     if TOKEN_FILE.exists():
-        return TOKEN_FILE.read_text(encoding="utf-8").strip()
+        value = TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if value:
+            return value
     if not create:
         return ""
     CONF_DIR.mkdir(parents=True, exist_ok=True)
-    tok = secrets.token_urlsafe(24)
-    TOKEN_FILE.write_text(tok + "\n", encoding="utf-8")
-    os.chmod(TOKEN_FILE, 0o600)
-    return tok
+    # Publish a fully written token atomically. O_EXCL alone still lets a loser
+    # read the file between the winner's create and write.
+    fd, temp_name = tempfile.mkstemp(prefix=".token-", dir=CONF_DIR)
+    temp = Path(temp_name)
+    try:
+        value = secrets.token_urlsafe(24)
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(value + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(temp, TOKEN_FILE)
+            return value
+        except FileExistsError:
+            existing = TOKEN_FILE.read_text(encoding="utf-8").strip()
+            if not existing:
+                raise BridgeError("token file exists but is empty")
+            return existing
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 class BridgeError(RuntimeError):
@@ -102,11 +122,15 @@ def _read_frame(sock):
         fin = b1 & 0x80
         opcode = b1 & 0x0F
         masked = b2 & 0x80
+        if not masked:
+            raise BridgeError("client WebSocket frames must be masked")
         length = b2 & 0x7F
         if length == 126:
             length = struct.unpack(">H", _recv_exact(sock, 2))[0]
         elif length == 127:
             length = struct.unpack(">Q", _recv_exact(sock, 8))[0]
+        if length > 64 * 1024 * 1024:
+            raise BridgeError("WebSocket frame exceeds 64MB")
         mask = _recv_exact(sock, 4) if masked else b""
         payload = _recv_exact(sock, length) if length else b""
         if masked:
@@ -159,14 +183,25 @@ class Chrome:
         if not expected:
             raise BridgeError("no token; run: python3 bridge.py token")
 
-        self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            self.srv.bind(("127.0.0.1", self.port))   # localhost only, never 0.0.0.0
-        except OSError as e:
-            raise BridgeError(f"cannot bind 127.0.0.1:{self.port}: {e}")
+        deadline = time.monotonic() + self.wait
+        while True:
+            self.srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                self.srv.bind(("127.0.0.1", self.port))  # never 0.0.0.0
+                break
+            except OSError as exc:
+                self.srv.close()
+                self.srv = None
+                if exc.errno not in (48, 98) or time.monotonic() >= deadline:
+                    raise BridgeError(
+                        f"cannot bind 127.0.0.1:{self.port}: {exc}"
+                    ) from exc
+                # Another MCP client owns the one browser channel. Serialize
+                # rather than failing; the extension reconnects when it exits.
+                time.sleep(0.2)
         self.srv.listen(1)
-        self.srv.settimeout(self.wait)
+        self.srv.settimeout(max(0.1, deadline - time.monotonic()))
 
         try:
             conn, _ = self.srv.accept()

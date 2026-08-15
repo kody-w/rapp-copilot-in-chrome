@@ -290,7 +290,9 @@ def messages(c, tab):
     """
     return c.eval(
         tab,
-        """(() => [...document.querySelectorAll(
+        """(() => {
+        const seen = new Map();
+        return [...document.querySelectorAll(
           'gv-message-item,[data-e2e-is-outgoing]'
         )].map((node, index) => {
           const raw = (node.innerText || '').trim();
@@ -304,15 +306,21 @@ def messages(c, tab):
           const label = [...node.querySelectorAll('[aria-label]')]
             .map(el => el.getAttribute('aria-label') || '')
             .find(value => value.includes('Message from ')) || '';
+          const signature = [outbound ? 'outbound' : 'inbound', label, body]
+            .join('|');
+          const occurrence = (seen.get(signature) || 0) + 1;
+          seen.set(signature, occurrence);
           return {
             index,
             direction: outbound ? 'outbound' : 'inbound',
             from: outbound ? 'you' : (match?.[1] || '').replace(/\\s+/g, ''),
             body,
             label,
+            occurrence,
             raw,
           };
-        }).filter(item => item.body))()""",
+        }).filter(item => item.body);
+        })()""",
     )
 
 

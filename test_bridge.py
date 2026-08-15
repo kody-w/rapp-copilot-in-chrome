@@ -8,6 +8,7 @@ frame encode/decode at every length class, masking, ping/pong, and the two
 security checks that stand between a stray web page and a logged-in browser.
 """
 import base64, hashlib, json, os, socket, struct, sys, threading, time
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path.home() / "Documents/GitHub/rappter-chrome"))
@@ -20,6 +21,21 @@ def check(name, cond, detail=""):
 
 TOK = bridge.token()
 PORT = 8911
+
+print("\n0. CONCURRENT TOKEN CREATION PUBLISHES ONE COMPLETE VALUE")
+original_dir, original_file = bridge.CONF_DIR, bridge.TOKEN_FILE
+token_dir = Path(tempfile.mkdtemp(prefix="bridge-token-test-"))
+bridge.CONF_DIR = token_dir
+bridge.TOKEN_FILE = token_dir / "token"
+values = []
+threads = [threading.Thread(target=lambda: values.append(bridge.token())) for _ in range(20)]
+for thread in threads:
+    thread.start()
+for thread in threads:
+    thread.join()
+check("all token callers agree", len(set(values)) == 1)
+check("published token is complete", bridge.TOKEN_FILE.read_text().strip() == values[0])
+bridge.CONF_DIR, bridge.TOKEN_FILE = original_dir, original_file
 
 # ── a minimal client that behaves like the browser ──────────────────────────
 def client(origin="chrome-extension://abcdef", tok=None, on_open=None):
@@ -115,6 +131,18 @@ send_masked(sock2, json.dumps({"id": rid, "ok": True, "result": {"pong": True}})
 t2.join(timeout=10)
 check("call still resolves after a ping", result2.get("r") == {"pong": True})
 sock2.close()
+
+print("\n2B. UNMASKED CLIENT FRAMES ARE REJECTED")
+left, right = socket.socketpair()
+right.sendall(b"\x81\x05hello")
+try:
+    bridge._read_frame(left)
+    check("unmasked frame rejected", False)
+except bridge.BridgeError as exc:
+    check("unmasked frame rejected", "masked" in str(exc))
+finally:
+    left.close()
+    right.close()
 
 print("\n3. A WEB PAGE CANNOT DRIVE YOUR BROWSER")
 err = {}
