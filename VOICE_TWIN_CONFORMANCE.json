@@ -43,5 +43,15 @@
     ],
     "profile_issue": "https://github.com/kody-w/rapp-messaging/issues/2"
   },
+  "digital_understudy": {
+    "duration_days": 30,
+    "scope": "owner-private technical workflow only",
+    "pulse_kind": "body.twin-pulse",
+    "analysis_tools": [],
+    "prepared_action_execution": null,
+    "sensitive_personal_inference": "refused",
+    "raw_transport_identifiers": "redacted before persistence",
+    "completion": "final report with evidence citations and limitations"
+  },
   "open_question": "https://github.com/kody-w/rapp-1/issues/4"
 }

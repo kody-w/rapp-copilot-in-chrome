@@ -25,15 +25,18 @@ LEGACY_LAUNCHER = HOME / ".copilot" / "bin" / "rapp-copilot-in-chrome"
 LEGACY_SKILL = HOME / ".copilot" / "skills" / "rapp-copilot-in-chrome"
 JOURNAL = ROOT / ".install-journal.json"
 CONFIG_BACKUP = ROOT / ".mcp-config.install-backup"
+UNDERSTUDY_BARRIER = ROOT / ".understudy-start-barrier"
 
 RUNTIME_FILES = [
     "bridge.py",
     "build_voice_twin_egg.py",
     "discord_transport.py",
+    "digital_understudy.py",
     "gvoice.py",
     "imessage_transport.py",
     "install-local.sh",
     "install_local.py",
+    "install_understudy.py",
     "rappter_chrome_mcp.py",
     "rapp1.py",
     "messaging_transport.py",
@@ -44,6 +47,7 @@ RUNTIME_FILES = [
     "voice_twin_soul.md",
     "VOICE_TWIN_CONFORMANCE.json",
     "whatsapp_transport.py",
+    "com.rapp.digital-understudy.plist.template",
     "com.rapp.voice-assistant.plist.template",
     "rappter-voice-assistant.service.template",
 ]
@@ -52,12 +56,14 @@ TEST_FILES = [
     "test_mcp.py",
     "test_gvoice.py",
     "test_discord_transport.py",
+    "test_digital_understudy.py",
     "test_imessage_transport.py",
     "test_voice_assistant.py",
     "test_messaging_transport.py",
     "test_voice_twin.py",
     "test_whatsapp_transport.py",
     "test_install_local.py",
+    "test_install_understudy.py",
 ]
 
 
@@ -229,9 +235,15 @@ def recover_interrupted_install():
         swaps.append((destination, backup))
 
     was_loaded = bool(journal.get("service_was_loaded"))
+    understudy_was_loaded = bool(
+        journal.get("understudy_service_was_loaded")
+    )
     if journal.get("phase") != "committed":
         if was_loaded and voice_service_loaded():
             stop_voice_service()
+        if understudy_was_loaded and understudy_service_loaded():
+            UNDERSTUDY_BARRIER.unlink(missing_ok=True)
+            stop_understudy_service()
         restore_swaps(swaps)
         if journal.get("config_existed"):
             if not CONFIG_BACKUP.exists():
@@ -242,8 +254,18 @@ def recover_interrupted_install():
             fsync_directory(MCP_CONFIG.parent)
         if was_loaded:
             restart_voice_service()
+            if not voice_service_loaded():
+                raise RuntimeError("recovered Voice service did not load")
+        if understudy_was_loaded:
+            if journal.get("understudy_barrier_existed"):
+                write_bytes_atomic(UNDERSTUDY_BARRIER, b"committed\n")
+            restart_understudy_service()
+            if not understudy_service_loaded():
+                raise RuntimeError("recovered understudy service did not load")
     else:
         finish_swaps(swaps)
+        if understudy_was_loaded and not UNDERSTUDY_BARRIER.exists():
+            write_bytes_atomic(UNDERSTUDY_BARRIER, b"committed\n")
 
     CONFIG_BACKUP.unlink(missing_ok=True)
     JOURNAL.unlink(missing_ok=True)
@@ -321,6 +343,64 @@ def restart_voice_service():
     subprocess.run(["launchctl", "kickstart", "-p", target], check=True)
 
 
+def understudy_service_loaded():
+    if sys.platform != "darwin":
+        return False
+    plist = (
+        HOME
+        / "Library"
+        / "LaunchAgents"
+        / "com.rapp.digital-understudy.plist"
+    )
+    if not plist.exists():
+        return False
+    target = f"gui/{os.getuid()}/com.rapp.digital-understudy"
+    result = subprocess.run(
+        ["launchctl", "print", target],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0 and str(RUNTIME) in result.stdout
+
+
+def stop_understudy_service():
+    if sys.platform != "darwin":
+        return
+    target = f"gui/{os.getuid()}/com.rapp.digital-understudy"
+    result = subprocess.run(
+        ["launchctl", "bootout", target],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 and understudy_service_loaded():
+        raise RuntimeError("understudy service could not be stopped")
+    if understudy_service_loaded():
+        raise RuntimeError("understudy service remained loaded after bootout")
+
+
+def restart_understudy_service():
+    if sys.platform != "darwin":
+        return
+    target = f"gui/{os.getuid()}/com.rapp.digital-understudy"
+    plist = (
+        HOME
+        / "Library"
+        / "LaunchAgents"
+        / "com.rapp.digital-understudy.plist"
+    )
+    if not plist.exists():
+        raise RuntimeError(
+            f"Understudy service was loaded but its plist is missing: {plist}"
+        )
+    subprocess.run(
+        ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)],
+        check=True,
+    )
+    subprocess.run(["launchctl", "enable", target], check=False)
+    subprocess.run(["launchctl", "kickstart", "-p", target], check=True)
+
+
 def reload_extensions(bridge_module, window=6):
     """Best-effort reload of every configured Edge/Chrome profile."""
     seen = set()
@@ -375,10 +455,13 @@ def install(args):
     swaps = []
     original_config = MCP_CONFIG.read_bytes() if MCP_CONFIG.exists() else None
     was_loaded = voice_service_loaded()
+    understudy_was_loaded = understudy_service_loaded()
     journal = {
         "version": 1,
         "phase": "preparing",
         "service_was_loaded": was_loaded,
+        "understudy_service_was_loaded": understudy_was_loaded,
+        "understudy_barrier_existed": UNDERSTUDY_BARRIER.exists(),
         "config_existed": original_config is not None,
         "stages": [str(path) for path in stages],
         "swaps": [],
@@ -388,7 +471,10 @@ def install(args):
         for name in RUNTIME_FILES + TEST_FILES:
             source = SOURCE / name
             destination = runtime_stage / name
-            if name.endswith((".plist.template", ".service.template")):
+            if (
+                name.endswith((".plist.template", ".service.template"))
+                and name != "com.rapp.digital-understudy.plist.template"
+            ):
                 destination.write_text(
                     source.read_text(encoding="utf-8")
                     .replace("__PYTHON__", str(Path(sys.executable).resolve()))
@@ -450,6 +536,9 @@ def install(args):
             # Stop before swapping files so a resident Python process cannot
             # keep executing the old inode after a successful upgrade.
             stop_voice_service()
+        if understudy_was_loaded:
+            UNDERSTUDY_BARRIER.unlink(missing_ok=True)
+            stop_understudy_service()
 
         for stage, destination in (
             (runtime_stage, RUNTIME),
@@ -491,32 +580,53 @@ def install(args):
 
         if was_loaded:
             restart_voice_service()
+        if understudy_was_loaded:
+            restart_understudy_service()
 
         if not args.keep_legacy:
             LEGACY_LAUNCHER.unlink(missing_ok=True)
             shutil.rmtree(LEGACY_SKILL, ignore_errors=True)
         journal["phase"] = "committed"
         write_json_atomic(JOURNAL, journal)
+        if understudy_was_loaded:
+            write_bytes_atomic(UNDERSTUDY_BARRIER, b"committed\n")
         finish_swaps(swaps)
         CONFIG_BACKUP.unlink(missing_ok=True)
         JOURNAL.unlink(missing_ok=True)
         fsync_directory(ROOT)
-    except Exception:
-        restore_swaps(swaps)
-        if original_config is None:
-            MCP_CONFIG.unlink(missing_ok=True)
-        else:
-            MCP_CONFIG.write_bytes(original_config)
-            os.chmod(MCP_CONFIG, 0o600)
-        if was_loaded:
-            try:
+    except Exception as install_error:
+        try:
+            if was_loaded and voice_service_loaded():
+                stop_voice_service()
+            if understudy_was_loaded and understudy_service_loaded():
+                UNDERSTUDY_BARRIER.unlink(missing_ok=True)
+                stop_understudy_service()
+            restore_swaps(swaps)
+            if original_config is None:
+                MCP_CONFIG.unlink(missing_ok=True)
+            else:
+                MCP_CONFIG.write_bytes(original_config)
+                os.chmod(MCP_CONFIG, 0o600)
+            if was_loaded:
                 restart_voice_service()
-            except Exception:
-                pass
+                if not voice_service_loaded():
+                    raise RuntimeError("previous Voice service did not recover")
+            if understudy_was_loaded:
+                if journal.get("understudy_barrier_existed"):
+                    write_bytes_atomic(UNDERSTUDY_BARRIER, b"committed\n")
+                restart_understudy_service()
+                if not understudy_service_loaded():
+                    raise RuntimeError("previous understudy service did not recover")
+        except Exception as recovery_error:
+            # Keep the journal and config backup for the next installer run.
+            fsync_directory(ROOT)
+            raise RuntimeError(
+                "install failed and rollback is incomplete"
+            ) from recovery_error
         CONFIG_BACKUP.unlink(missing_ok=True)
         JOURNAL.unlink(missing_ok=True)
         fsync_directory(ROOT)
-        raise
+        raise install_error
     finally:
         for stage in stages:
             shutil.rmtree(stage, ignore_errors=True)
