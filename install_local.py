@@ -28,12 +28,17 @@ CONFIG_BACKUP = ROOT / ".mcp-config.install-backup"
 
 RUNTIME_FILES = [
     "bridge.py",
+    "build_voice_twin_egg.py",
     "gvoice.py",
     "install-local.sh",
     "install_local.py",
     "rappter_chrome_mcp.py",
+    "rapp1.py",
     "voice_assistant.py",
-    "voice_command_center.py",
+    "voice_twin.py",
+    "voice_twin_agent.py",
+    "voice_twin_soul.md",
+    "VOICE_TWIN_CONFORMANCE.json",
     "com.rapp.voice-assistant.plist.template",
     "rappter-voice-assistant.service.template",
 ]
@@ -42,7 +47,7 @@ TEST_FILES = [
     "test_mcp.py",
     "test_gvoice.py",
     "test_voice_assistant.py",
-    "test_voice_command_center.py",
+    "test_voice_twin.py",
     "test_install_local.py",
 ]
 
