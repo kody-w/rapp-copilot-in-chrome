@@ -582,7 +582,14 @@ def _city_snapshot(now=None):
 
 
 def _sentinel_snapshot(now=None):
-    value = read_json(SENTINEL_VERDICT, default=None)
+    try:
+        value = read_json(SENTINEL_VERDICT, default=None)
+    except RuntimeError:
+        return {
+            "available": False,
+            "error": "invalid-json",
+            "age_seconds": _source_age(SENTINEL_VERDICT, now=now),
+        }
     if not isinstance(value, dict):
         return {"available": False}
     checks = value.get("checks") or value.get("results") or []
@@ -626,7 +633,14 @@ def _sentinel_snapshot(now=None):
 
 
 def _small_source(path, now=None):
-    value = read_json(path, default=None)
+    try:
+        value = read_json(path, default=None)
+    except RuntimeError:
+        return {
+            "available": False,
+            "error": "invalid-json",
+            "age_seconds": _source_age(path, now=now),
+        }
     if value is None:
         return {"available": False}
     summary = {}
