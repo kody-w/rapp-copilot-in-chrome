@@ -49,6 +49,22 @@ reported = [
     for stdout, _ in outputs
 ]
 assert reported == [published, published]
+understudy_template = (
+    parallel_home
+    / ".rappter-chrome"
+    / "runtime"
+    / "com.rapp.digital-understudy.plist.template"
+).read_text()
+assert "__PYTHON__" in understudy_template
+assert "__RUNTIME__" in understudy_template
+voice_template = (
+    parallel_home
+    / ".rappter-chrome"
+    / "runtime"
+    / "com.rapp.voice-assistant.plist.template"
+).read_text()
+assert "__PYTHON__" not in voice_template
+assert "__RUNTIME__" not in voice_template
 print("installer concurrency serialization passed")
 
 # Failure after the first directory swap must restore every old directory.
@@ -92,6 +108,71 @@ rollback = subprocess.run(
 )
 assert rollback.returncode == 0, rollback.stderr
 print(rollback.stdout.strip())
+
+# A failure after restarting an upgraded understudy must stop it, restore the
+# old files, and verify the old service before deleting the journal.
+service_home = pathlib.Path(
+    tempfile.mkdtemp(prefix="rappter-install-service-rollback-")
+)
+service_script = textwrap.dedent(
+    f"""
+    import argparse, importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "installer", {str(root / "install_local.py")!r}
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    for target in (module.RUNTIME, module.EXTENSION, module.SKILL_DIR):
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "old-marker").write_text("old")
+    module.UNDERSTUDY_BARRIER.write_text("committed")
+    state = {{"loaded": True, "stops": 0, "starts": 0, "barriers": []}}
+    module.voice_service_loaded = lambda: False
+    module.understudy_service_loaded = lambda: state["loaded"]
+    def stop():
+        state["loaded"] = False
+        state["stops"] += 1
+    def restart():
+        state["loaded"] = True
+        state["starts"] += 1
+        state["barriers"].append(module.UNDERSTUDY_BARRIER.exists())
+    module.stop_understudy_service = stop
+    module.restart_understudy_service = restart
+    original_write = module.write_json_atomic
+    def fail_commit(path, value):
+        if path == module.JOURNAL and value.get("phase") == "committed":
+            raise RuntimeError("commit journal failed")
+        return original_write(path, value)
+    module.write_json_atomic = fail_commit
+    try:
+        module.install(argparse.Namespace(keep_legacy=False, no_open=True))
+    except RuntimeError as exc:
+        assert "commit journal failed" in str(exc)
+    else:
+        raise AssertionError("expected post-restart failure")
+    assert state == {{
+        "loaded": True,
+        "stops": 2,
+        "starts": 2,
+        "barriers": [False, True],
+    }}
+    for target in (module.RUNTIME, module.EXTENSION, module.SKILL_DIR):
+        assert (target / "old-marker").read_text() == "old"
+    assert not module.JOURNAL.exists()
+    print("installer service rollback passed")
+    """
+)
+service_rollback = subprocess.run(
+    [sys.executable, "-c", service_script],
+    capture_output=True,
+    text=True,
+    env={**os.environ, "HOME": str(service_home)},
+)
+assert service_rollback.returncode == 0, (
+    service_rollback.stdout,
+    service_rollback.stderr,
+)
+print(service_rollback.stdout.strip())
 
 # SIGKILL after the first published directory leaves a journal that restores
 # the coherent previous generation on the next run.
