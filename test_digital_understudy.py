@@ -357,6 +357,15 @@ sentinel_path.unlink()
 assert understudy._sentinel_snapshot()["available"] is False
 sentinel_path.write_bytes(sentinel_bytes)
 
+health_bytes = understudy.AUTOHARNESS_HEALTH.read_bytes()
+understudy.AUTOHARNESS_HEALTH.write_bytes(b"")
+invalid_optional = understudy._small_source(
+    understudy.AUTOHARNESS_HEALTH
+)
+assert invalid_optional["available"] is False
+assert invalid_optional["error"] == "invalid-json"
+understudy.AUTOHARNESS_HEALTH.write_bytes(health_bytes)
+
 injected = {
     **snapshot,
     "sources": {
