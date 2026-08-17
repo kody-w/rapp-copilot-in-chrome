@@ -98,22 +98,56 @@ is never placed in the URL or sent on the wire: client and server prove possessi
 nonces and directional HMAC-SHA256 proofs. A hostile local process can occupy the port and cause
 denial of service, but cannot authenticate as the server or issue browser commands.
 
-### Google Voice and persistent Copilot chat
+### Google Voice transport for a hatched twin
 
 `gvoice.py` operates the signed-in Google Voice web app and confirms sent text by reading it back
 as an outgoing message. `voice_assistant.py` locks both the Google account and peer number through
 `~/.rappter-chrome/config.json`, watermarks existing history on first run, and uses:
 
 ```
-read inbound -> ask Copilot with zero tools -> persist intent
-             -> send -> confirm by readback -> mark handled
+observe inbound -> reserve stable twin turn -> Brainstem agents -> persist result
+                -> prepare outbound -> attempt once -> readback -> mark handled
 ```
 
-If the process dies after delivery but before final state save, the next tick compares the
-outgoing count to the durable pre-send baseline and finalizes without sending twice. State uses
-unique atomic temp files, directory fsync, a known-good backup, and a process lock. The assistant
-runs Copilot silently in an empty sandbox with no tools, no built-in MCPs, and no repository
-instructions; transcript text is encoded as untrusted JSON and Unicode controls are stripped.
+The browser is transport only—there is no handwritten conversational command
+grammar. Every inbound turn goes to one durable curated Brainstem twin. Asking
+for Hacker News follows the normal
+`brainstem.py -> HackerNewsAgent.perform() -> result` loop; the transport never
+returns a promise that another process will act later.
+
+The owner-private hatch loads VoiceTwin memory, HackerNews, and bounded
+text/encoding utilities. Shell, package installation, dynamic agent creation,
+filesystem editing, unrestricted browser/messaging, and autonomous
+Copilot/Claude dispatch are absent. The broker selects this roster before model
+execution. Transport, principal, conversation, audience, and binding IDs are
+HMAC-derived; raw account/peer values never enter logical session keys or logs.
+
+Stable turn IDs and a durable twin journal prevent agent replay. If a send is
+ambiguous, its state becomes `unknown`: recovery performs readback only and
+never resends automatically. State uses atomic temp files, directory fsync, a
+known-good backup, and a process lock.
+
+Each installation mints one canonical RAPP/1 rappid, appends exact eleven-key
+`memory.chat-turn` frames, and can build a deterministic `rapp/1-egg`
+`rapplication` with one root `agent.py`:
+
+```bash
+python3 ~/.rappter-chrome/runtime/build_voice_twin_egg.py
+```
+
+The pinned rev-5 reference is byte-identical to
+`kody-w/rapp-1@6723c7a`. The implementation reports
+`structural-pre-acceptance`, not full/authenticated RAPP/1 conformance:
+registered genesis/trust, exact section-8 facade acceptance, and a Google Voice
+transport profile remain open at
+<https://github.com/kody-w/rapp-1/issues/4>. See
+`VOICE_TWIN_CONFORMANCE.json`.
+
+Google Voice web remains the single text leader. The optional Android adapter
+is Wi-Fi/VoIP-only and owns no text delivery or automated calling. Future
+WhatsApp/Discord adapters must implement the same observe/claim/process and
+prepare/attempt/reconcile states; adapters never chat, grant authority, share
+credentials, or retry ambiguous effects.
 
 Example machine-local config (keep it mode `0600`):
 
@@ -125,6 +159,10 @@ Example machine-local config (keep it mode `0600`):
   "google_voice_peer": "5558675309",
   "google_voice_owner": "Owner",
   "google_voice_model": "gpt-5.6-sol",
+  "brainstem_root": "/absolute/path/to/.brainstem",
+  "rapp_owner": "github-login",
+  "voice_twin_slug": "voice-twin",
+  "voice_twin_timeout_seconds": 240,
   "max_replies_per_hour": 6
 }
 ```
@@ -139,7 +177,8 @@ cd ~/.rappter-chrome/runtime
 python3 test_bridge.py           # 19 protocol/security/profile checks
 python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translations
 python3 test_gvoice.py           # cold start and stale-thread refusal
-python3 test_voice_assistant.py  # 39 crash, injection, identity assertions
+python3 test_voice_assistant.py  # crash, injection, identity assertions
+python3 test_voice_twin.py       # RAPP/1 identity, frames, hatch, replay
 python3 test_install_local.py    # config, concurrency, rollback, SIGKILL recovery
 ```
 
@@ -289,13 +328,19 @@ extension/                        vendorless MV3 extension
 bridge.py                         zero-dependency localhost WebSocket transport
 rappter_chrome_mcp.py             11-tool stdio MCP server
 gvoice.py                         account-locked Google Voice browser driver
-voice_assistant.py                persistent, verified Copilot SMS loop
+voice_assistant.py                exactly-once Google Voice transport loop
+voice_twin.py                     durable curated Brainstem twin runtime
+voice_twin_agent.py               single-file rapplication agent of record
+rapp1.py                          pinned rev-5 identity/frame/egg reference
+build_voice_twin_egg.py           deterministic RAPP/1 rapplication hatcher
+VOICE_TWIN_CONFORMANCE.json       explicit pre-acceptance boundary
 com.rapp.voice-assistant.plist.template  macOS resident service
 rappter-voice-assistant.service.template Linux user service
 test_bridge.py                    protocol and security tests
 test_mcp.py                       MCP protocol smoke test
 test_gvoice.py                    browser cold-start and DOM-settle tests
 test_voice_assistant.py           message-loop safety tests
+test_voice_twin.py                twin, RAPP/1, and RAPP Messaging tests
 test_install_local.py             config, concurrency, and rollback tests
 ```
 

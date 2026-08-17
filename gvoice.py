@@ -32,6 +32,7 @@ letting a caller conclude you have no messages.
 import json
 import os
 import re
+import secrets
 import sys
 import time
 import urllib.parse
@@ -77,6 +78,51 @@ SELECTORS = {
 }
 
 
+def trusted_voice_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "voice.google.com"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and re.fullmatch(r"/u/\d+/messages/?", parsed.path) is not None
+    )
+
+
+def require_voice_url(value, label="Google Voice URL"):
+    if not trusted_voice_url(value):
+        raise BridgeError(f"{label} is not the exact https://voice.google.com origin")
+    return urllib.parse.urlsplit(value)
+
+
+def canonical_peer_number(value):
+    raw = str(value or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if raw.startswith("+") and 8 <= len(digits) <= 15:
+        return f"+{digits}"
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    raise BridgeError(
+        "Google Voice peer must be E.164 (+country...) or a US 10-digit number"
+    )
+
+
+def tab_url(c, tab):
+    value = next(
+        (item["url"] for item in c.tabs() if item["tabId"] == tab),
+        "",
+    )
+    require_voice_url(value, "current Google Voice tab")
+    return value
+
+
 def config():
     try:
         return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -92,14 +138,21 @@ def expected_account():
     ).strip().lower()
 
 
+def account_from_label(label):
+    emails = re.findall(
+        r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}",
+        str(label or ""),
+    )
+    return emails[0].lower() if len(emails) == 1 else ""
+
+
 def account_for_tab(c, tab):
     label = c.eval(
         tab,
         """document.querySelector('[aria-label^="Google Account:"]')
              ?.getAttribute('aria-label') || ''""",
     )
-    match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", label or "")
-    return match.group(0).lower() if match else ""
+    return account_from_label(label)
 
 
 def first_match(c, tab, kind, limit=40):
@@ -117,7 +170,11 @@ def first_match(c, tab, kind, limit=40):
 def open_voice(c):
     want = expected_account()
     target_url = config().get("google_voice_url") or MESSAGES_URL
-    voice_tabs = [tab for tab in c.tabs() if "voice.google.com" in (tab.get("url") or "")]
+    require_voice_url(target_url, "configured Google Voice URL")
+    voice_tabs = [
+        tab for tab in c.tabs()
+        if trusted_voice_url(tab.get("url"))
+    ]
     accounts = {}
     tab = None
     for candidate in voice_tabs:
@@ -147,23 +204,26 @@ def open_voice(c):
 
     # Preserve /u/N from the tab selected above. Navigating an account-matched
     # /u/1 tab back to the hardcoded /u/0 URL silently switches identities.
-    current = next(
-        (item["url"] for item in c.tabs() if item["tabId"] == tab),
-        MESSAGES_URL,
-    )
-    parsed = urllib.parse.urlsplit(current)
+    current = tab_url(c, tab)
+    parsed = require_voice_url(current, "selected Google Voice tab")
     match = re.search(r"/u/\d+/messages", parsed.path)
     messages_url = (
-        f"{parsed.scheme}://{parsed.netloc}{match.group(0)}"
+        f"https://voice.google.com{match.group(0)}"
         if match
         else MESSAGES_URL
     )
     c.navigate(tab, messages_url)
+    tab_url(c, tab)
     # The app renders after the shell loads; waiting on the network is not
     # enough and a fixed sleep is either slow or flaky.
     for sel in SELECTORS["thread_list"]:
         try:
             c.waitfor(tab, sel, timeout=12000)
+            post_account = account_for_tab(c, tab)
+            if want and post_account != want:
+                raise SystemExit(
+                    "Google Voice account changed during navigation; refusing"
+                )
             return tab
         except BridgeError:
             continue
@@ -212,27 +272,91 @@ def pick(threads_list, who):
 
 
 def messages_url_for_tab(c, tab):
-    current = next(
-        (item["url"] for item in c.tabs() if item["tabId"] == tab),
-        MESSAGES_URL,
-    )
-    parsed = urllib.parse.urlsplit(current)
+    current = tab_url(c, tab)
+    parsed = require_voice_url(current, "Google Voice thread tab")
     match = re.search(r"/u/\d+/messages", parsed.path)
     return (
-        f"{parsed.scheme}://{parsed.netloc}{match.group(0)}"
+        f"https://voice.google.com{match.group(0)}"
         if match
         else MESSAGES_URL
     )
 
 
-def wait_for_thread(c, tab, attempts=60, delay=0.25):
+def require_peer_thread(c, tab, peer):
+    number = canonical_peer_number(peer)
+    current = tab_url(c, tab)
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(current).query)
+    if query.get("itemId") != [f"t.{number}"]:
+        raise BridgeError("Google Voice did not remain on the configured peer thread")
+    return number
+
+
+def wait_for_thread(
+    c,
+    tab,
+    attempts=60,
+    delay=0.25,
+    previous_marker=None,
+    peer=None,
+    account=None,
+):
     """Wait for either an existing message or a visible compose box."""
-    expression = """(() => {
+    marker_json = json.dumps(previous_marker or "")
+    account_json = json.dumps(str(account or "").lower())
+    peer_digits = re.sub(r"\D", "", canonical_peer_number(peer)) if peer else ""
+    peer_digits_json = json.dumps(peer_digits)
+    item_id_json = json.dumps(
+        f"t.{canonical_peer_number(peer)}" if peer else ""
+    )
+    expression = f"""(() => {{
+      if (
+        {marker_json}
+        && document.documentElement?.getAttribute(
+          'data-rapp-navigation-marker'
+        ) === {marker_json}
+      ) return false;
+      if ({item_id_json}) {{
+        let url;
+        try {{
+          url = new URL(window.location.href);
+        }} catch (_) {{
+          return false;
+        }}
+        const label = document.querySelector(
+          '[aria-label^="Google Account:"]'
+        )?.getAttribute('aria-label') || '';
+        const emails = label.match(
+          /[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{{2,}}/g
+        ) || [];
+        const header = document.querySelector(
+          'gv-thread-details-header h2'
+        );
+        const headerDigits = String(
+          header?.innerText || header?.textContent || ''
+        ).replace(/\\D/g, '');
+        const expectedDigits = {peer_digits_json};
+        const peerOk = headerDigits === expectedDigits
+          || (
+            expectedDigits.length === 11
+            && expectedDigits.startsWith('1')
+            && headerDigits === expectedDigits.slice(1)
+          );
+        const itemIds = url.searchParams.getAll('itemId');
+        if (
+          url.origin !== 'https://voice.google.com'
+          || !/^\\/u\\/\\d+\\/messages\\/?$/.test(url.pathname)
+          || itemIds.length !== 1
+          || itemIds[0] !== {item_id_json}
+          || emails.length !== 1
+          || emails[0].toLowerCase() !== {account_json}
+          || !header || !header.offsetParent || !peerOk
+        ) return false;
+      }}
       if (document.querySelector('gv-message-item')) return true;
       return [...document.querySelectorAll(
         'textarea,div[contenteditable="true"][role="textbox"]'
       )].some(element => !!element.offsetParent);
-    })()"""
+    }})()"""
     for _ in range(attempts):
         try:
             if c.eval(tab, expression):
@@ -246,17 +370,35 @@ def wait_for_thread(c, tab, attempts=60, delay=0.25):
 def open_thread(c, tab, who):
     digits = re.sub(r"\D", "", who)
     if len(digits) >= 7:
-        number = f"+{digits}" if who.strip().startswith("+") else f"+1{digits[-10:]}"
+        number = canonical_peer_number(who)
         item_id = urllib.parse.quote(f"t.{number}", safe="")
+        marker = secrets.token_hex(16)
+        c.eval(
+            tab,
+            f"""(() => {{
+              document.documentElement?.setAttribute(
+                'data-rapp-navigation-marker',
+                {json.dumps(marker)}
+              );
+              return true;
+            }})()""",
+        )
         c.navigate(tab, f"{messages_url_for_tab(c, tab)}?itemId={item_id}")
         # Navigation settles when the document is complete, but Voice renders
         # the thread asynchronously afterwards. Reading immediately produced
         # an empty list and the watcher reported "no new inbound messages"
         # while the reply was visibly present in the browser.
-        if not wait_for_thread(c, tab):
+        if not wait_for_thread(
+            c,
+            tab,
+            previous_marker=marker,
+            peer=number,
+            account=expected_account(),
+        ):
             raise BridgeError(
                 f"Google Voice thread for {number} did not render within 15 seconds"
             )
+        require_peer_thread(c, tab, who)
         return {"who": number, "i": None}
 
     sel, tl = threads(c, tab)
@@ -329,19 +471,170 @@ def messages(c, tab):
     )
 
 
+def messages_locked(c, tab, peer, account):
+    """Read one atomically account-, URL-, and rendered-peer-bound snapshot."""
+    number = canonical_peer_number(peer)
+    account = str(account or "").strip().lower()
+    if not account:
+        raise BridgeError("a configured Google Voice account is required to read")
+    expected_item = json.dumps(f"t.{number}")
+    expected_account_json = json.dumps(account)
+    expected_digits = json.dumps(re.sub(r"\D", "", number))
+    snapshot = c.eval(
+        tab,
+        f"""(() => {{
+          let url;
+          try {{
+            url = new URL(window.location.href);
+          }} catch (_) {{
+            return {{ok:false, why:'invalid Voice URL'}};
+          }}
+          const label = document.querySelector(
+            '[aria-label^="Google Account:"]'
+          )?.getAttribute('aria-label') || '';
+          const emails = label.match(
+            /[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{{2,}}/g
+          ) || [];
+          const header = document.querySelector(
+            'gv-thread-details-header h2'
+          );
+          const headerDigits = String(
+            header?.innerText || header?.textContent || ''
+          ).replace(/\\D/g, '');
+          const wantedDigits = {expected_digits};
+          const peerOk = headerDigits === wantedDigits
+            || (
+              wantedDigits.length === 11
+              && wantedDigits.startsWith('1')
+              && headerDigits === wantedDigits.slice(1)
+            );
+          const itemIds = url.searchParams.getAll('itemId');
+          const contextOk = url.origin === 'https://voice.google.com'
+            && /^\\/u\\/\\d+\\/messages\\/?$/.test(url.pathname)
+            && itemIds.length === 1
+            && itemIds[0] === {expected_item}
+            && emails.length === 1
+            && emails[0].toLowerCase() === {expected_account_json}
+            && !!header && !!header.offsetParent && peerOk;
+          if (!contextOk) {{
+            return {{
+              ok:false,
+              why:'account, URL, or rendered peer did not match'
+            }};
+          }}
+          const seen = new Map();
+          const items = [...document.querySelectorAll(
+            'gv-message-item,[data-e2e-is-outgoing]'
+          )].map((node, index) => {{
+            const raw = (node.innerText || '').trim();
+            const bodyNode = node.querySelector('.subject-content-container')
+              || node.querySelector('[data-e2e-message-text]')
+              || node.querySelector('.message-row');
+            const body = (
+              bodyNode?.innerText || bodyNode?.textContent || ''
+            ).replace(/\\s+/g, ' ').trim();
+            const outbound = /(^|\\n)Message from you,/.test(raw);
+            const match = raw.match(/Message from ([^,]+),/);
+            const messageLabel = [...node.querySelectorAll('[aria-label]')]
+              .map(el => el.getAttribute('aria-label') || '')
+              .find(value => value.includes('Message from ')) || '';
+            const declaration = raw.split('\\n')
+              .map(line => line.trim())
+              .find(line => line.startsWith('Message from ')) || '';
+            const identity = messageLabel || declaration || raw;
+            const signature = [
+              outbound ? 'outbound' : 'inbound',
+              identity,
+              body
+            ].join('|');
+            const occurrence = (seen.get(signature) || 0) + 1;
+            seen.set(signature, occurrence);
+            return {{
+              index,
+              direction: outbound ? 'outbound' : 'inbound',
+              from: outbound
+                ? 'you'
+                : (match?.[1] || '').replace(/\\s+/g, ''),
+              body,
+              label: messageLabel,
+              identity,
+              occurrence,
+              raw,
+            }};
+          }}).filter(item => item.body);
+          return {{ok:true, items}};
+        }})()""",
+    )
+    if not isinstance(snapshot, dict) or not snapshot.get("ok"):
+        detail = snapshot.get("why") if isinstance(snapshot, dict) else "invalid snapshot"
+        raise BridgeError(f"Google Voice locked read failed: {detail}")
+    if not isinstance(snapshot.get("items"), list):
+        raise BridgeError("Google Voice locked read returned invalid messages")
+    return snapshot["items"]
+
+
 def send(c, tab, who, text, confirm=True):
     """Type and send. `confirm` re-reads the thread to prove it landed.
 
     An automation that reports success because a click did not throw is the
     same mistake as trusting an exit code — the message has to appear.
     """
-    open_thread(c, tab, who)
+    account = expected_account()
+    if not account:
+        raise BridgeError("a configured Google Voice account is required to send")
+    number = canonical_peer_number(who)
+    open_thread(c, tab, number)
+    require_peer_thread(c, tab, number)
     want = json.dumps(text)
+    want_account = json.dumps(account)
+    want_item_id = json.dumps(f"t.{number}")
+    want_peer_digits = json.dumps(re.sub(r"\D", "", number))
 
     composed = c.eval(
         tab,
         f"""(async () => {{
           const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const validContext = () => {{
+            let url;
+            try {{
+              url = new URL(window.location.href);
+            }} catch (_) {{
+              return false;
+            }}
+            const label = document.querySelector(
+              '[aria-label^="Google Account:"]'
+            )?.getAttribute('aria-label') || '';
+            const emails = label.match(
+              /[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{{2,}}/g
+            ) || [];
+            const account = emails.length === 1 ? emails[0].toLowerCase() : '';
+            const header = document.querySelector(
+              'gv-thread-details-header h2'
+            );
+            const headerDigits = String(
+              header?.innerText || header?.textContent || ''
+            ).replace(/\\D/g, '');
+            const expectedDigits = {want_peer_digits};
+            const peerOk = headerDigits === expectedDigits
+              || (
+                expectedDigits.length === 11
+                && expectedDigits.startsWith('1')
+                && headerDigits === expectedDigits.slice(1)
+              );
+            const itemIds = url.searchParams.getAll('itemId');
+            return url.protocol === 'https:'
+              && url.hostname === 'voice.google.com'
+              && (url.port === '' || url.port === '443')
+              && !url.username && !url.password
+              && /^\\/u\\/\\d+\\/messages\\/?$/.test(url.pathname)
+              && itemIds.length === 1
+              && itemIds[0] === {want_item_id}
+              && account === {want_account}
+              && !!header && !!header.offsetParent && peerOk;
+          }};
+          if (!validContext()) {{
+            return {{ok:false, why:'account or thread changed before compose'}};
+          }}
           const pick = () => {{
             const all = [...document.querySelectorAll(
               'textarea,div[contenteditable="true"][role="textbox"]'
@@ -358,6 +651,9 @@ def send(c, tab, who, text, confirm=True):
             if (!box) await sleep(250);
           }}
           if (!box) return {{ok:false, why:'no message input appeared'}};
+          if (!box.isConnected || !validContext()) {{
+            return {{ok:false, why:'account or thread changed before compose'}};
+          }}
           box.focus();
           const value = {want};
           if (box.tagName === 'TEXTAREA') {{
@@ -385,20 +681,105 @@ def send(c, tab, who, text, confirm=True):
 
     before = c.eval(
         tab,
-        f"""(() => [...document.querySelectorAll(
-          'gv-message-item,[data-e2e-is-outgoing]'
-        )].filter(n => {{
+        f"""(() => {{
+          let url;
+          try {{
+            url = new URL(window.location.href);
+          }} catch (_) {{
+            return {{ok:false, count:0}};
+          }}
+          const label = document.querySelector(
+            '[aria-label^="Google Account:"]'
+          )?.getAttribute('aria-label') || '';
+          const emails = label.match(
+            /[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{{2,}}/g
+          ) || [];
+          const account = emails.length === 1 ? emails[0].toLowerCase() : '';
+          const header = document.querySelector(
+            'gv-thread-details-header h2'
+          );
+          const headerDigits = String(
+            header?.innerText || header?.textContent || ''
+          ).replace(/\\D/g, '');
+          const expectedDigits = {want_peer_digits};
+          const peerOk = headerDigits === expectedDigits
+            || (
+              expectedDigits.length === 11
+              && expectedDigits.startsWith('1')
+              && headerDigits === expectedDigits.slice(1)
+            );
+          const itemIds = url.searchParams.getAll('itemId');
+          const ok = url.protocol === 'https:'
+            && url.hostname === 'voice.google.com'
+            && (url.port === '' || url.port === '443')
+            && !url.username && !url.password
+            && /^\\/u\\/\\d+\\/messages\\/?$/.test(url.pathname)
+            && itemIds.length === 1
+            && itemIds[0] === {want_item_id}
+            && account === {want_account}
+            && !!header && !!header.offsetParent && peerOk;
+          if (!ok) return {{ok:false, count:0}};
+          const count = [...document.querySelectorAll(
+            'gv-message-item,[data-e2e-is-outgoing]'
+          )].filter(n => {{
+          const normalize = value => String(value || '')
+            .replace(/\\s+/g, ' ').trim();
           const mine = !!n.querySelector('.outgoing')
             || n.getAttribute('data-e2e-is-outgoing') === 'true'
             || String(n.className || '').includes('outgoing');
-          return mine && (n.innerText || '').includes({want});
-        }}).length)()""",
+          return mine && normalize(n.innerText).includes(normalize({want}));
+          }}).length;
+          return {{ok:true, count}};
+        }})()""",
     )
+    if not before.get("ok"):
+        raise BridgeError("Google Voice account or thread changed before send")
 
     clicked = c.eval(
         tab,
-        """(async () => {
+        f"""(async () => {{
           const sleep = ms => new Promise(r => setTimeout(r, ms));
+          const validContext = () => {{
+            let url;
+            try {{
+              url = new URL(window.location.href);
+            }} catch (_) {{
+              return false;
+            }}
+            const label = document.querySelector(
+              '[aria-label^="Google Account:"]'
+            )?.getAttribute('aria-label') || '';
+            const emails = label.match(
+              /[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{{2,}}/g
+            ) || [];
+            const account = emails.length === 1 ? emails[0].toLowerCase() : '';
+            const header = document.querySelector(
+              'gv-thread-details-header h2'
+            );
+            const headerDigits = String(
+              header?.innerText || header?.textContent || ''
+            ).replace(/\\D/g, '');
+            const expectedDigits = {want_peer_digits};
+            const peerOk = headerDigits === expectedDigits
+              || (
+                expectedDigits.length === 11
+                && expectedDigits.startsWith('1')
+                && headerDigits === expectedDigits.slice(1)
+              );
+            const itemIds = url.searchParams.getAll('itemId');
+            return url.protocol === 'https:'
+              && url.hostname === 'voice.google.com'
+              && (url.port === '' || url.port === '443')
+              && !url.username && !url.password
+              && /^\\/u\\/\\d+\\/messages\\/?$/.test(url.pathname)
+              && itemIds.length === 1
+              && itemIds[0] === {want_item_id}
+              && account === {want_account}
+              && !!header && !!header.offsetParent && peerOk;
+          }};
+          if (!validContext()) {{
+            return {{ok:false, why:'account or thread changed before send'}};
+          }}
           const find = () =>
             document.querySelector('button[gv-test-id="send-button"]:not([disabled])')
             || [...document.querySelectorAll('button')].find(
@@ -406,32 +787,94 @@ def send(c, tab, who, text, confirm=True):
                 && !b.disabled && !!b.offsetParent
             );
           let button = null;
-          for (let i = 0; i < 20 && !button; i++) {
+          for (let i = 0; i < 20 && !button; i++) {{
             button = find();
             if (!button) await sleep(250);
-          }
-          if (!button) return {ok:false, why:'send button never became enabled'};
+          }}
+          if (!button) {{
+            return {{ok:false, why:'send button never became enabled'}};
+          }}
+          const box = [...document.querySelectorAll(
+            'textarea,div[contenteditable="true"][role="textbox"]'
+          )].find(el => !!el.offsetParent);
+          const value = box?.tagName === 'TEXTAREA'
+            ? box.value
+            : box?.textContent;
+          if (!button.isConnected || !box?.isConnected || value !== {want}) {{
+            return {{ok:false, why:'compose contents changed before send'}};
+          }}
+          if (!validContext()) {{
+            return {{ok:false, why:'account or thread changed before send'}};
+          }}
           button.click();
-          return {ok:true};
-        })()""",
+          return {{ok:true}};
+        }})()""",
     )
     if not clicked.get("ok"):
         raise SystemExit(f"could not send message: {clicked.get('why')}")
 
     deadline = time.monotonic() + 15
     while time.monotonic() < deadline:
-        count = c.eval(
+        observed = c.eval(
             tab,
-            f"""(() => [...document.querySelectorAll(
-              'gv-message-item,[data-e2e-is-outgoing]'
-            )].filter(n => {{
+            f"""(() => {{
+              let url;
+              try {{
+                url = new URL(window.location.href);
+              }} catch (_) {{
+                return {{ok:false, count:0}};
+              }}
+              const label = document.querySelector(
+                '[aria-label^="Google Account:"]'
+              )?.getAttribute('aria-label') || '';
+              const emails = label.match(
+                /[\\w.+-]+@[\\w.-]+\\.[A-Za-z]{{2,}}/g
+              ) || [];
+              const account = emails.length === 1
+                ? emails[0].toLowerCase()
+                : '';
+              const header = document.querySelector(
+                'gv-thread-details-header h2'
+              );
+              const headerDigits = String(
+                header?.innerText || header?.textContent || ''
+              ).replace(/\\D/g, '');
+              const expectedDigits = {want_peer_digits};
+              const peerOk = headerDigits === expectedDigits
+                || (
+                  expectedDigits.length === 11
+                  && expectedDigits.startsWith('1')
+                  && headerDigits === expectedDigits.slice(1)
+                );
+              const itemIds = url.searchParams.getAll('itemId');
+              const ok = url.protocol === 'https:'
+                && url.hostname === 'voice.google.com'
+                && (url.port === '' || url.port === '443')
+                && !url.username && !url.password
+                && /^\\/u\\/\\d+\\/messages\\/?$/.test(url.pathname)
+                && itemIds.length === 1
+                && itemIds[0] === {want_item_id}
+                && account === {want_account}
+                && !!header && !!header.offsetParent && peerOk;
+              if (!ok) return {{ok:false, count:0}};
+              const count = [...document.querySelectorAll(
+                'gv-message-item,[data-e2e-is-outgoing]'
+              )].filter(n => {{
+              const normalize = value => String(value || '')
+                .replace(/\\s+/g, ' ').trim();
               const mine = !!n.querySelector('.outgoing')
                 || n.getAttribute('data-e2e-is-outgoing') === 'true'
                 || String(n.className || '').includes('outgoing');
-              return mine && (n.innerText || '').includes({want});
-            }}).length)()""",
+              return mine && normalize(n.innerText).includes(normalize({want}));
+              }}).length;
+              return {{ok:true, count}};
+            }})()""",
         )
-        if count > before:
+        if not observed.get("ok"):
+            raise BridgeError(
+                "Google Voice account or thread changed during send readback"
+            )
+        if observed["count"] > before["count"]:
             return {"sent": True, "verified": True}
         time.sleep(0.4)
     raise SystemExit(

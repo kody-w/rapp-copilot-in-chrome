@@ -1,0 +1,35 @@
+{
+  "schema": "rapp-voice-twin-conformance/1.0",
+  "status": "structural-pre-acceptance",
+  "rapp_1": {
+    "authority_repository": "kody-w/rapp-1",
+    "authority_commit": "6723c7add2aed36bb68992fc71a56b0a4bd5ad81",
+    "reference_file": "rapp1.py",
+    "reference_sha256": "c945ee85f01af5cd374490b40721d07f2aca7c8bd6d209e0d2933420f55db284",
+    "implemented": [
+      "mint-once keyless rappid",
+      "exact eleven-key memory.chat-turn frames",
+      "domain-separated hashes",
+      "deterministic rapplication egg"
+    ],
+    "not_claimed": [
+      "authenticated registry acceptance",
+      "registered genesis acceptance",
+      "signed trust acceptance",
+      "exact section 8 facade acceptance"
+    ]
+  },
+  "rapp_messaging": {
+    "profile": "rapp-messaging/1.0",
+    "scope": "owner-private",
+    "implemented": [
+      "hashed transport and conversation identifiers",
+      "curated tools selected before model execution",
+      "durable inbox and outbox state",
+      "single transport process lease",
+      "ambiguous sends are not retried automatically"
+    ],
+    "profile_gap": "No ratified Google Voice transport profile exists."
+  },
+  "open_question": "https://github.com/kody-w/rapp-1/issues/4"
+}

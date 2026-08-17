@@ -28,11 +28,17 @@ CONFIG_BACKUP = ROOT / ".mcp-config.install-backup"
 
 RUNTIME_FILES = [
     "bridge.py",
+    "build_voice_twin_egg.py",
     "gvoice.py",
     "install-local.sh",
     "install_local.py",
     "rappter_chrome_mcp.py",
+    "rapp1.py",
     "voice_assistant.py",
+    "voice_twin.py",
+    "voice_twin_agent.py",
+    "voice_twin_soul.md",
+    "VOICE_TWIN_CONFORMANCE.json",
     "com.rapp.voice-assistant.plist.template",
     "rappter-voice-assistant.service.template",
 ]
@@ -41,6 +47,7 @@ TEST_FILES = [
     "test_mcp.py",
     "test_gvoice.py",
     "test_voice_assistant.py",
+    "test_voice_twin.py",
     "test_install_local.py",
 ]
 
@@ -165,10 +172,17 @@ def swap_dir(stage, destination, backup=None):
 
 def restore_swaps(swaps):
     for destination, backup in reversed(swaps):
-        if destination.exists():
+        if backup:
+            # A missing backup means the journal was persisted before the
+            # swap began. The intact destination must not be deleted.
+            if backup.exists():
+                if destination.exists():
+                    shutil.rmtree(destination, ignore_errors=True)
+                backup.rename(destination)
+        elif destination.exists():
+            # No prior destination existed, so any published target belongs
+            # to the interrupted generation and is safe to remove.
             shutil.rmtree(destination, ignore_errors=True)
-        if backup and backup.exists():
-            backup.rename(destination)
         fsync_directory(destination.parent)
 
 
