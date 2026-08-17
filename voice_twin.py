@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import gvoice
+import messaging_transport
 import rapp1
 
 HERE = Path(__file__).resolve().parent
@@ -28,6 +29,7 @@ FRAME_DIR = TWIN_ROOT / "frames"
 IDENTITY_FILE = TWIN_ROOT / "rappid.json"
 INSTALLATION_FILE = TWIN_ROOT / "installation.json"
 TRANSPORT_FILE = TWIN_ROOT / "transport-binding.json"
+BINDINGS_DIR = TWIN_ROOT / "bindings"
 SECRET_FILE = TWIN_ROOT / "transport-binding.key"
 MEMORY_FILE = TWIN_ROOT / "memory.json"
 LOCK_FILE = TWIN_ROOT / ".twin.lock"
@@ -61,6 +63,9 @@ CURATED_TOOL_NAMES = (
     "UrlCode",
     "UUIDGenerator",
     "VoiceTwin",
+)
+EXTERNAL_TOOL_NAMES = tuple(
+    name for name in CURATED_TOOL_NAMES if name != "VoiceTwin"
 )
 ACTION_CLAIM = re.compile(
     r"\b(?:i\s+)?(?:ran|executed|changed|modified|edited|fixed|deleted|"
@@ -194,15 +199,21 @@ def _sha256(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def prepare_agents(cfg):
+def _prepare_agents_profile(cfg, scope):
     source, python = _brainstem_paths(cfg)
     wanted = {
         name: _sha256(source / "agents" / name)
         for name in CURATED_AGENT_FILES
     }
-    wanted["voice_twin_agent.py"] = _sha256(AGENT_FILE)
+    owner_private = scope == "owner-private"
+    profile = "owner-private" if owner_private else "external"
+    if owner_private:
+        wanted["voice_twin_agent.py"] = _sha256(AGENT_FILE)
+    target = AGENTS_DIR if owner_private else TWIN_ROOT / "agents-external"
+    tool_names = CURATED_TOOL_NAMES if owner_private else EXTERNAL_TOOL_NAMES
     manifest = {
         "schema": "rapp-voice-twin-agents/1.0",
+        "scope": profile,
         "agents": wanted,
         "excluded_capabilities": [
             "arbitrary shell",
@@ -213,36 +224,44 @@ def prepare_agents(cfg):
             "unrestricted messaging",
         ],
     }
-    existing = _read_json(AGENTS_DIR / "manifest.json")
+    existing = _read_json(target / "manifest.json")
     if existing == manifest and all(
-        (AGENTS_DIR / name).is_file() for name in wanted
+        (target / name).is_file() for name in wanted
     ):
-        return source, python
+        return source, python, target, tool_names
 
     TWIN_ROOT.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=".agents-stage-", dir=TWIN_ROOT))
-    backup = TWIN_ROOT / f".agents-backup-{os.getpid()}-{secrets.token_hex(4)}"
+    backup = TWIN_ROOT / (
+        f".{target.name}-backup-{os.getpid()}-{secrets.token_hex(4)}"
+    )
     try:
         for name in CURATED_AGENT_FILES:
             shutil.copy2(source / "agents" / name, stage / name)
             os.chmod(stage / name, 0o600)
-        shutil.copy2(AGENT_FILE, stage / "voice_twin_agent.py")
-        os.chmod(stage / "voice_twin_agent.py", 0o600)
+        if owner_private:
+            shutil.copy2(AGENT_FILE, stage / "voice_twin_agent.py")
+            os.chmod(stage / "voice_twin_agent.py", 0o600)
         _write_json_atomic(stage / "manifest.json", manifest)
         _fsync_directory(stage)
-        if AGENTS_DIR.exists():
-            AGENTS_DIR.rename(backup)
-        stage.rename(AGENTS_DIR)
+        if target.exists():
+            target.rename(backup)
+        stage.rename(target)
         _fsync_directory(TWIN_ROOT)
         if backup.exists():
             shutil.rmtree(backup)
     except Exception:
-        if not AGENTS_DIR.exists() and backup.exists():
-            backup.rename(AGENTS_DIR)
+        if not target.exists() and backup.exists():
+            backup.rename(target)
         raise
     finally:
         if stage.exists():
             shutil.rmtree(stage)
+    return source, python, target, tool_names
+
+
+def prepare_agents(cfg):
+    source, python, _, _ = _prepare_agents_profile(cfg, "owner-private")
     return source, python
 
 
@@ -296,10 +315,7 @@ def _private_id(secret, label, value):
     return f"{label}:{digest}"
 
 
-def transport_context(cfg, rappid, message_id):
-    account = str(cfg["google_voice_account"]).strip().lower()
-    peer = gvoice.canonical_peer_number(cfg["google_voice_peer"])
-    secret = _secret()
+def _installation():
     installation = _read_json(INSTALLATION_FILE)
     if installation is None:
         installation = {
@@ -316,26 +332,122 @@ def transport_context(cfg, rappid, message_id):
         )
     ):
         raise RuntimeError("Voice Twin installation identity is invalid")
+    return installation
 
-    account_id = _private_id(secret, "account", account)
-    principal_id = _private_id(secret, "principal", peer)
-    conversation_id = _private_id(secret, "conversation", f"{account}\n{peer}")
-    audience_id = _private_id(secret, "audience", conversation_id)
-    binding_id = _private_id(secret, "binding", f"{account}\n{peer}\n{rappid}")
+
+def channel_context(cfg, rappid, envelope, *, preserve_event_id=False):
+    envelope = messaging_transport.validate_inbound_envelope(envelope)
+    transport = envelope["transport"]
+    secret = _secret()
+    installation = _installation()
+    legacy_voice = preserve_event_id and transport == "google-voice-web"
+    if legacy_voice:
+        account_id = _private_id(
+            secret,
+            "account",
+            envelope["account_subject"],
+        )
+        principal_id = _private_id(
+            secret,
+            "principal",
+            envelope["principal_subject"],
+        )
+        conversation_id = _private_id(
+            secret,
+            "conversation",
+            envelope["conversation_subject"],
+        )
+        participant_ids = [principal_id]
+    else:
+        account_id = _private_id(
+            secret,
+            "account",
+            f"{transport}\n{envelope['account_subject']}",
+        )
+        principal_id = _private_id(
+            secret,
+            "principal",
+            f"{transport}\n{envelope['principal_subject']}",
+        )
+        conversation_id = _private_id(
+            secret,
+            "conversation",
+            f"{transport}\n{envelope['conversation_subject']}",
+        )
+        participant_ids = sorted({
+            _private_id(secret, "principal", f"{transport}\n{value}")
+            for value in envelope["participant_subjects"]
+        })
+    if envelope["scope"] == "group-shared" and len(participant_ids) < 2:
+        raise RuntimeError("group-shared scope requires a verified roster")
+    if legacy_voice:
+        roster_epoch = "owner-private-1"
+        audience_id = _private_id(secret, "audience", conversation_id)
+        binding_id = _private_id(
+            secret,
+            "binding",
+            (
+                f"{envelope['account_subject']}\n"
+                f"{envelope['principal_subject']}\n{rappid}"
+            ),
+        )
+    else:
+        roster_epoch = _private_id(
+            secret,
+            "roster",
+            (
+                f"{transport}\n{envelope['roster_epoch']}\n"
+                + "\n".join(participant_ids)
+            ),
+        )
+        audience_id = _private_id(
+            secret,
+            "audience",
+            f"{conversation_id}\n{roster_epoch}\n{envelope['scope']}",
+        )
+        binding_id = _private_id(
+            secret,
+            "binding",
+            f"{transport}\n{envelope['account_subject']}\n{rappid}",
+        )
+    remote_event_id = envelope["remote_event_id"]
+    if preserve_event_id and re.fullmatch(r"[a-f0-9]{20}", remote_event_id):
+        source_event_id = remote_event_id
+        turn_id = remote_event_id
+    else:
+        source_event_id = _private_id(
+            secret,
+            "event",
+            f"{transport}\n{remote_event_id}",
+        )
+        turn_id = source_event_id.split(":", 1)[1]
+    stream_instance = {
+        "google-voice-web": "google-voice",
+        "whatsapp-cloud": "whatsapp-cloud",
+    }.get(transport, transport)
+    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", stream_instance):
+        raise RuntimeError("transport cannot form a RAPP memory stream")
     binding = {
         "schema": "rapp-messaging-transport-binding/1.0",
         "installation_id": installation["installation_id"],
         "rappter_id": rappid,
-        "transport": "google-voice-web",
+        "transport": transport,
         "account_id": account_id,
         "binding_id": binding_id,
-        "role": "owner",
+        "role": "owner" if legacy_voice else "service",
         "active": True,
         "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
-    existing = _read_json(TRANSPORT_FILE)
+    if transport == "google-voice-web":
+        binding_path = TRANSPORT_FILE
+    else:
+        BINDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        binding_path = BINDINGS_DIR / (
+            f"{transport}-{binding_id.split(':', 1)[1][:16]}.json"
+        )
+    existing = _read_json(binding_path)
     if existing is None:
-        _write_json_atomic(TRANSPORT_FILE, binding)
+        _write_json_atomic(binding_path, binding)
     elif any(
         existing.get(key) != binding[key]
         for key in (
@@ -355,15 +467,60 @@ def transport_context(cfg, rappid, message_id):
         "schema": "rapp-messaging-conversation/1.0",
         "conversation_id": conversation_id,
         "soul_id": rappid,
-        "scope": "owner-private",
+        "scope": envelope["scope"],
         "principal_id": principal_id,
         "audience_id": audience_id,
-        "participant_ids": [principal_id],
-        "roster_epoch": "owner-private-1",
-        "source_event_id": message_id,
-        "allowed_tools": list(CURATED_TOOL_NAMES),
+        "participant_ids": participant_ids,
+        "roster_epoch": roster_epoch,
+        "source_event_id": source_event_id,
+        "allowed_tools": list(
+            CURATED_TOOL_NAMES
+            if envelope["scope"] == "owner-private"
+            else EXTERNAL_TOOL_NAMES
+        ),
     }
+    descriptor = {
+        "transport": transport,
+        "turn_id": turn_id,
+        "stream_instance": stream_instance,
+    }
+    return binding, context, descriptor
+
+
+def transport_context(cfg, rappid, message_id):
+    account = str(cfg["google_voice_account"]).strip().lower()
+    peer = gvoice.canonical_peer_number(cfg["google_voice_peer"])
+    envelope = {
+        "schema": "rapp-messaging-inbound/1.0",
+        "transport": "google-voice-web",
+        "remote_event_id": message_id,
+        "account_subject": account,
+        "principal_subject": peer,
+        "conversation_subject": f"{account}\n{peer}",
+        "scope": "owner-private",
+        "participant_subjects": [peer],
+        "roster_epoch": "owner-private-1",
+        "text": "_",
+        "reply_target": {},
+    }
+    binding, context, _ = channel_context(
+        cfg,
+        rappid,
+        envelope,
+        preserve_event_id=True,
+    )
     return binding, context
+
+
+def google_voice_conversation_binding(cfg):
+    with twin_lock():
+        rappid = ensure_identity(cfg)
+        _, context = transport_context(cfg, rappid, "0" * 20)
+    return {
+        "schema": "rapp-messaging-bound-conversation/1.0",
+        "conversation_id": context["conversation_id"],
+        "audience_id": context["audience_id"],
+    }
 
 
 def _history(conversation_state):
@@ -383,6 +540,48 @@ def _history(conversation_state):
         if content:
             output.append({"role": role, "content": content})
     return output
+
+
+def _stored_history(context, current_turn_id):
+    values = []
+    if not TURN_DIR.exists():
+        return values
+    records = []
+    for path in TURN_DIR.glob("*.json"):
+        value = _read_json(path)
+        if (
+            isinstance(value, dict)
+            and value.get("status") == "completed"
+            and value.get("message_id") != current_turn_id
+            and value.get("conversation_id") == context["conversation_id"]
+            and value.get("audience_id") == context["audience_id"]
+            and isinstance(value.get("user_input"), str)
+            and isinstance(value.get("response"), str)
+        ):
+            records.append(value)
+    records.sort(
+        key=lambda value: (
+            value.get("completed_at", ""),
+            value.get("message_id", ""),
+        )
+    )
+    for record in records[-6:]:
+        values.extend([
+            {"role": "user", "content": safe_text(record["user_input"], 2000)},
+            {"role": "assistant", "content": safe_text(record["response"], 2000)},
+        ])
+    return values
+
+
+def _conversation_history(context, current_turn_id, conversation_state):
+    expected_binding = {
+        "schema": "rapp-messaging-bound-conversation/1.0",
+        "conversation_id": context["conversation_id"],
+        "audience_id": context["audience_id"],
+    }
+    if conversation_state.get("conversation_binding") == expected_binding:
+        return _history(conversation_state)
+    return _stored_history(context, current_turn_id)
 
 
 def _clean_env(cfg, source, context, rappid, soul_path):
@@ -468,12 +667,16 @@ def action_claim_supported(reply, agent_names):
 
 
 def _run_twin(message_id, text, conversation_state, cfg, rappid, context):
-    source, python = prepare_agents(cfg)
+    source, python, agents_dir, _ = _prepare_agents_profile(
+        cfg,
+        context["scope"],
+    )
+    history = _conversation_history(context, message_id, conversation_state)
     request = {
         "user_input": safe_text(text, 4000),
-        "conversation_history": _history(conversation_state),
+        "conversation_history": history,
         "session_id": context["conversation_id"],
-        "idempotency_key": message_id,
+        "idempotency_key": context["source_event_id"],
     }
     soul = SOUL_FILE.read_text(encoding="utf-8")
     soul += (
@@ -517,7 +720,10 @@ def _run_twin(message_id, text, conversation_state, cfg, rappid, context):
             text=True,
             timeout=int(cfg.get("voice_twin_timeout_seconds", 240)),
             cwd=TWIN_ROOT,
-            env=_clean_env(cfg, source, context, rappid, soul_name),
+            env={
+                **_clean_env(cfg, source, context, rappid, soul_name),
+                "AGENTS_PATH": str(agents_dir),
+            },
         )
         if result.returncode != 0:
             raise RuntimeError("Brainstem twin process failed")
@@ -551,7 +757,7 @@ def _run_twin(message_id, text, conversation_state, cfg, rappid, context):
 
 
 def _turn_path(message_id):
-    if not re.fullmatch(r"[a-f0-9]{20}", str(message_id or "")):
+    if not re.fullmatch(r"(?:[a-f0-9]{20}|[a-f0-9]{64})", str(message_id or "")):
         raise RuntimeError("Voice Twin message identity is invalid")
     return TURN_DIR / f"{message_id}.json"
 
@@ -584,12 +790,13 @@ def _write_turn(record):
     _write_json_atomic(_turn_path(record["message_id"]), record)
 
 
-def _load_frames(expected_stream_id):
+def _load_frames(expected_stream_id, directory=None):
     frames = []
-    if not FRAME_DIR.exists():
+    directory = Path(directory or FRAME_DIR)
+    if not directory.exists():
         return frames
     head = None
-    for path in sorted(FRAME_DIR.glob("*.json")):
+    for path in sorted(directory.glob("*.json")):
         if not re.fullmatch(r"\d{20}\.json", path.name):
             raise RuntimeError("Voice Twin frame directory contains an invalid file")
         frame = _read_json(path)
@@ -610,10 +817,17 @@ def _load_frames(expected_stream_id):
 
 
 def _ensure_frame(record, rappid):
-    stream_id = f"{rappid}:google-voice"
-    frames = _load_frames(stream_id)
+    stream_instance = record.get("stream_instance") or "google-voice"
+    stream_id = f"{rappid}:{stream_instance}"
+    directory = (
+        FRAME_DIR
+        if stream_instance == "google-voice"
+        else FRAME_DIR / stream_instance
+    )
+    frames = _load_frames(stream_id, directory)
+    source_event_id = record.get("source_event_id") or record["message_id"]
     for frame in frames:
-        if frame["payload"].get("message_id") == record["message_id"]:
+        if frame["payload"].get("message_id") == source_event_id:
             if frame["payload"].get("response") != record["response"]:
                 raise RuntimeError("Voice Twin turn conflicts with its RAPP/1 frame")
             return frame["frame_hash"]
@@ -628,9 +842,12 @@ def _ensure_frame(record, rappid):
         utc,
         {
             "agent_names": record["agent_names"],
-            "message_id": record["message_id"],
+            "audience_id": record.get("audience_id", ""),
+            "conversation_id": record.get("conversation_id", ""),
+            "message_id": source_event_id,
             "response": record["response"],
-            "scope": "owner-private",
+            "scope": record.get("scope", "owner-private"),
+            "transport": record.get("transport", "google-voice-web"),
             "user_input": record["user_input"],
         },
         prev=head["payload_hash"] if head else None,
@@ -642,25 +859,31 @@ def _ensure_frame(record, rappid):
     )
     if not ok:
         raise RuntimeError(f"new Voice Twin frame failed step {step}: {reason}")
-    FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    directory.mkdir(parents=True, exist_ok=True)
     _write_bytes_atomic(
-        FRAME_DIR / f"{frame['seq']:020d}.json",
+        directory / f"{frame['seq']:020d}.json",
         rapp1.canonical(frame).encode("utf-8"),
     )
     return frame["frame_hash"]
 
 
-def chat(message_id, text, conversation_state, cfg):
-    """Return one durable twin result for one stable inbound message."""
-    message_id = str(message_id or "")
-    user_input = safe_text(text, 4000).strip()
+def chat_channel(envelope, conversation_state, cfg, *, preserve_event_id=False):
+    """Return one durable twin result for one validated transport event."""
+    envelope = messaging_transport.validate_inbound_envelope(dict(envelope))
+    user_input = safe_text(envelope["text"], 4000).strip()
     if not user_input:
         raise RuntimeError("Voice Twin input is empty")
     request_hash = hashlib.sha256(user_input.encode("utf-8")).hexdigest()
 
     with twin_lock():
         rappid = ensure_identity(cfg)
-        _, context = transport_context(cfg, rappid, message_id)
+        _, context, descriptor = channel_context(
+            cfg,
+            rappid,
+            envelope,
+            preserve_event_id=preserve_event_id,
+        )
+        message_id = descriptor["turn_id"]
         record = _load_turn(message_id)
         if record is not None:
             if record["request_hash"] != request_hash:
@@ -687,6 +910,12 @@ def chat(message_id, text, conversation_state, cfg):
             "message_id": message_id,
             "request_hash": request_hash,
             "user_input": user_input,
+            "source_event_id": context["source_event_id"],
+            "transport": descriptor["transport"],
+            "stream_instance": descriptor["stream_instance"],
+            "conversation_id": context["conversation_id"],
+            "audience_id": context["audience_id"],
+            "scope": context["scope"],
             "status": "executing",
             "created_at": _utc(),
         }
@@ -728,3 +957,28 @@ def chat(message_id, text, conversation_state, cfg):
         current["frame_hash"] = frame_hash
         _write_turn(current)
         return response
+
+
+def chat(message_id, text, conversation_state, cfg):
+    """Compatibility entry point for the exact Google Voice owner channel."""
+    account = str(cfg["google_voice_account"]).strip().lower()
+    peer = gvoice.canonical_peer_number(cfg["google_voice_peer"])
+    envelope = {
+        "schema": "rapp-messaging-inbound/1.0",
+        "transport": "google-voice-web",
+        "remote_event_id": str(message_id or ""),
+        "account_subject": account,
+        "principal_subject": peer,
+        "conversation_subject": f"{account}\n{peer}",
+        "scope": "owner-private",
+        "participant_subjects": [peer],
+        "roster_epoch": "owner-private-1",
+        "text": text,
+        "reply_target": {},
+    }
+    return chat_channel(
+        envelope,
+        conversation_state,
+        cfg,
+        preserve_event_id=True,
+    )

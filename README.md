@@ -127,6 +127,25 @@ ambiguous, its state becomes `unknown`: recovery performs readback only and
 never resends automatically. State uses atomic temp files, directory fsync, a
 known-good backup, and a process lock.
 
+### Universal messaging channels
+
+[`UNIVERSAL_MESSAGING.md`](UNIVERSAL_MESSAGING.md) defines one shared
+identity, trust broker, conversation/audience-scoped history, FIFO inbox,
+single-writer lease, and durable outbox for four adapters:
+
+- Google Voice web is the live owner-private channel.
+- iMessage is macOS-only, pins `imsg 0.12.3`, requires explicit chat
+  enrollment and permissions, forces iMessage, and never falls back to SMS.
+- Discord uses an official bot, Gateway/REST, mention-gated public guild
+  context, restrictive mentions, and nonce-enforced sends.
+- WhatsApp verifies signed Cloud API webhooks, preserves opaque `wamid`/BSUID
+  identities, and enforces customer-service-window/template policy.
+
+iMessage, Discord, and WhatsApp are disabled by default. Raw provider IDs are
+HMAC-bound before persistence, owner memory tools are physically absent from
+non-owner rosters, provider evidence merges monotonically, and no adapter
+retries an ambiguous effect.
+
 Each installation mints one canonical RAPP/1 rappid, appends exact eleven-key
 `memory.chat-turn` frames, and can build a deterministic `rapp/1-egg`
 `rapplication` with one root `agent.py`:
@@ -141,13 +160,12 @@ The pinned rev-5 reference is byte-identical to
 registered genesis/trust, exact section-8 facade acceptance, and a Google Voice
 transport profile remain open at
 <https://github.com/kody-w/rapp-1/issues/4>. See
-`VOICE_TWIN_CONFORMANCE.json`.
+`VOICE_TWIN_CONFORMANCE.json`. Google Voice, Discord, and WhatsApp profile
+registration is tracked at
+<https://github.com/kody-w/rapp-messaging/issues/2>.
 
-Google Voice web remains the single text leader. The optional Android adapter
-is Wi-Fi/VoIP-only and owns no text delivery or automated calling. Future
-WhatsApp/Discord adapters must implement the same observe/claim/process and
-prepare/attempt/reconcile states; adapters never chat, grant authority, share
-credentials, or retry ambiguous effects.
+Android calling remains a separate optional Wi-Fi/VoIP observation transport
+and owns no text delivery or automated calling.
 
 Example machine-local config (keep it mode `0600`):
 
@@ -163,7 +181,10 @@ Example machine-local config (keep it mode `0600`):
   "rapp_owner": "github-login",
   "voice_twin_slug": "voice-twin",
   "voice_twin_timeout_seconds": 240,
-  "max_replies_per_hour": 6
+  "max_replies_per_hour": 6,
+  "imessage_enabled": false,
+  "discord_enabled": false,
+  "whatsapp_enabled": false
 }
 ```
 
@@ -179,6 +200,10 @@ python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translatio
 python3 test_gvoice.py           # cold start and stale-thread refusal
 python3 test_voice_assistant.py  # crash, injection, identity assertions
 python3 test_voice_twin.py       # RAPP/1 identity, frames, hatch, replay
+python3 test_messaging_transport.py # shared FIFO/trust/no-resend
+python3 test_imessage_transport.py  # macOS-only imsg channel
+python3 test_discord_transport.py   # official bot Gateway/REST
+python3 test_whatsapp_transport.py  # signed Cloud API webhooks
 python3 test_install_local.py    # config, concurrency, rollback, SIGKILL recovery
 ```
 
@@ -331,6 +356,12 @@ gvoice.py                         account-locked Google Voice browser driver
 voice_assistant.py                exactly-once Google Voice transport loop
 voice_twin.py                     durable curated Brainstem twin runtime
 voice_twin_agent.py               single-file rapplication agent of record
+messaging_transport.py            shared FIFO inbox/outbox and writer leases
+universal_messaging.py            transport-neutral twin dispatcher
+imessage_transport.py             macOS-only supervised imsg adapter
+discord_transport.py              official Discord bot adapter
+whatsapp_transport.py             official WhatsApp Cloud API adapter
+UNIVERSAL_MESSAGING.md            channel setup and trust contract
 rapp1.py                          pinned rev-5 identity/frame/egg reference
 build_voice_twin_egg.py           deterministic RAPP/1 rapplication hatcher
 VOICE_TWIN_CONFORMANCE.json       explicit pre-acceptance boundary
@@ -341,6 +372,10 @@ test_mcp.py                       MCP protocol smoke test
 test_gvoice.py                    browser cold-start and DOM-settle tests
 test_voice_assistant.py           message-loop safety tests
 test_voice_twin.py                twin, RAPP/1, and RAPP Messaging tests
+test_messaging_transport.py       shared state-machine and isolation tests
+test_imessage_transport.py        macOS-only channel tests
+test_discord_transport.py         Discord adapter tests
+test_whatsapp_transport.py        WhatsApp adapter tests
 test_install_local.py             config, concurrency, and rollback tests
 ```
 

@@ -26,6 +26,14 @@ loaded_config = assistant.config()
 assert loaded_config["google_voice_account"] == "expected@example.com"
 assert loaded_config["google_voice_peer"] == "+15558675309"
 assert loaded_config["google_voice_peer_legacy"] == "5558675309"
+TEST_BINDING = {
+    "schema": "rapp-messaging-bound-conversation/1.0",
+    "conversation_id": "conversation:" + ("a" * 64),
+    "audience_id": "audience:" + ("b" * 64),
+}
+assistant.voice_twin.google_voice_conversation_binding = (
+    lambda cfg: dict(TEST_BINDING)
+)
 
 messages = [
     {
@@ -254,6 +262,15 @@ finally:
     assistant.gvoice.open_voice = original_open_voice
 
 original_twin_chat = assistant.voice_twin.chat
+original_twin_binding = assistant.voice_twin.google_voice_conversation_binding
+expected_binding = {
+    "schema": "rapp-messaging-bound-conversation/1.0",
+    "conversation_id": "conversation:" + ("a" * 64),
+    "audience_id": "audience:" + ("b" * 64),
+}
+assistant.voice_twin.google_voice_conversation_binding = (
+    lambda cfg: dict(expected_binding)
+)
 twin_call = {}
 assistant.voice_twin.chat = (
     lambda message_id, text, state, cfg: (
@@ -262,6 +279,7 @@ assistant.voice_twin.chat = (
     )[1]
 )
 try:
+    response_state = {}
     assert assistant.respond(
         {
             "direction": "inbound",
@@ -270,12 +288,32 @@ try:
             "raw": "x",
             "_stable_message_id": "d" * 20,
         },
-        {},
+        response_state,
         {"google_voice_peer": "5558675309"},
     ) == "twin reply"
     assert twin_call == {"message_id": "d" * 20, "text": "status"}
+    assert response_state["conversation_binding"] == expected_binding
+    try:
+        assistant.respond(
+            {
+                "body": "must not cross",
+                "_stable_message_id": "e" * 20,
+            },
+            {
+                "conversation_binding": {
+                    **expected_binding,
+                    "audience_id": "audience:" + ("c" * 64),
+                },
+                "transcript": [{"role": "Owner", "text": "old secret"}],
+            },
+            {"google_voice_peer": "5558675309"},
+        )
+        raise AssertionError("changed Voice binding reached the twin")
+    except RuntimeError as exc:
+        assert "explicit migration required" in str(exc)
 finally:
     assistant.voice_twin.chat = original_twin_chat
+    assistant.voice_twin.google_voice_conversation_binding = original_twin_binding
 
 # Same-conversation turns are FIFO: failure on the oldest inbound prevents a
 # later message or tool action from overtaking it.
@@ -387,12 +425,14 @@ legacy_pending_id = assistant.message_id(pending_inbound)
 pending_reply = "already delivered legacy reply"
 pending_state = assistant.default_state()
 pending_state["initialized_at"] = assistant.iso()
+pending_state["conversation_binding"] = dict(TEST_BINDING)
 pending_state["pending"] = {
     "message_id": legacy_pending_id,
     "inbound_text": pending_inbound["body"],
     "reply": pending_reply,
     "baseline": 0,
     "created_at": assistant.iso(),
+    "conversation_binding": dict(TEST_BINDING),
 }
 assistant.save_state(pending_state)
 assistant.collect = lambda cfg: [
@@ -417,6 +457,45 @@ assert mapped_pending_state["pending"] is None
 assert legacy_pending_id not in mapped_pending_state["handled"]
 assert len(mapped_pending_state["handled"]) == 1
 
+# A pending reply is bound to its original conversation before readback or
+# sender invocation; changing account/peer configuration cannot redirect it.
+assistant.STATE_FILE = tmp / "cross-binding-pending-state.json"
+cross_state = assistant.default_state()
+cross_state["initialized_at"] = assistant.iso()
+cross_state["conversation_binding"] = dict(TEST_BINDING)
+cross_state["pending"] = {
+    "message_id": "f" * 20,
+    "inbound_text": "bound to old peer",
+    "reply": "must not cross",
+    "baseline": 0,
+    "created_at": assistant.iso(),
+    "delivery_state": "prepared",
+    "attempted_at": None,
+    "conversation_binding": dict(TEST_BINDING),
+}
+assistant.save_state(cross_state)
+changed_binding = {
+    **TEST_BINDING,
+    "conversation_id": "conversation:" + ("d" * 64),
+    "audience_id": "audience:" + ("e" * 64),
+}
+assistant.voice_twin.google_voice_conversation_binding = (
+    lambda cfg: dict(changed_binding)
+)
+assistant.collect = lambda cfg: []
+assert assistant.tick(
+    responder=lambda *args: (
+        (_ for _ in ()).throw(AssertionError("cross-binding twin ran"))
+    ),
+    sender=lambda *args: (
+        (_ for _ in ()).throw(AssertionError("cross-binding send ran"))
+    ),
+) == 0
+assistant.voice_twin.google_voice_conversation_binding = (
+    lambda cfg: dict(TEST_BINDING)
+)
+assert assistant.load_state()["pending"]["delivery_state"] == "prepared"
+
 # Legacy pending baselines used exact body equality. Whitespace-normalized
 # readback must not falsely finalize such a pending reply.
 assistant.STATE_FILE = tmp / "legacy-baseline-state.json"
@@ -428,6 +507,7 @@ baseline_inbound = {
 }
 baseline_state = assistant.default_state()
 baseline_state["initialized_at"] = assistant.iso()
+baseline_state["conversation_binding"] = dict(TEST_BINDING)
 baseline_rows, _ = assistant.assign_message_ids(
     baseline_state,
     [baseline_inbound],
@@ -440,6 +520,7 @@ baseline_state["pending"] = {
     "reply": "same\nreply",
     "baseline": 0,
     "created_at": assistant.iso(),
+    "conversation_binding": dict(TEST_BINDING),
 }
 assistant.save_state(baseline_state)
 assistant.collect = lambda cfg: [
@@ -469,12 +550,14 @@ assistant.STATE_FILE = tmp / "unmapped-pending-state.json"
 missing_pending = {**pending_inbound, "body": "not visible", "raw": "not visible"}
 unmapped_state = assistant.default_state()
 unmapped_state["initialized_at"] = assistant.iso()
+unmapped_state["conversation_binding"] = dict(TEST_BINDING)
 unmapped_state["pending"] = {
     "message_id": assistant.message_id(missing_pending),
     "inbound_text": missing_pending["body"],
     "reply": "must not resend",
     "baseline": 0,
     "created_at": assistant.iso(),
+    "conversation_binding": dict(TEST_BINDING),
 }
 assistant.save_state(unmapped_state)
 assistant.collect = lambda cfg: [pending_inbound]
@@ -657,6 +740,7 @@ assert len(assistant.delivery_text("x" * 900, "c" * 20)) == 900
 assistant.STATE_FILE = tmp / "backup-ambiguous-state.json"
 backup_base = assistant.default_state()
 backup_base["initialized_at"] = assistant.iso()
+backup_base["conversation_binding"] = dict(TEST_BINDING)
 assistant.save_state(backup_base)
 backup_prepared = json.loads(json.dumps(backup_base))
 backup_prepared["pending"] = {
@@ -667,6 +751,7 @@ backup_prepared["pending"] = {
     "created_at": assistant.iso(),
     "delivery_state": "prepared",
     "attempted_at": None,
+    "conversation_binding": dict(TEST_BINDING),
 }
 assistant.save_state(backup_prepared)
 backup_attempted = json.loads(json.dumps(backup_prepared))
