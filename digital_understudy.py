@@ -77,7 +77,7 @@ BLOCKED_INFERENCE = re.compile(
     re.I,
 )
 PERSONAL_SUBJECT = re.compile(
-    r"\b(?:owner|user|person|they|their|he|she|his|her)\b",
+    r"\b(?:owner|person|they|their|he|she|his|her)\b",
     re.I,
 )
 ACTION_CLAIM = re.compile(
@@ -832,7 +832,10 @@ For each pattern include exactly: category, subject, statement, confidence
 (integer 0-100), inferred (boolean), and evidence_ids. Predictions include
 exactly those members plus horizon_days (1-30). subject must be one of:
 system, workflow, tool, project. Statements must be impersonal technical
-observations, never claims about a person.
+observations, never claims about a person. No summary, statement, reason,
+description, or limitation may contain these words: owner, person, they,
+their, he, she, his, her. The generic word user may refer only to software
+interaction or user experience, never to personal traits.
 category must be exactly one of: technical-workflow, reliability, tool-usage,
 planning-process, communication-process. Never use "system" as a category.
 Every pattern, prediction, and proposal requires at least one allowlisted
