@@ -65,6 +65,7 @@ def default_state():
     return {
         "handled": [],
         "transcript": [],
+        "conversation_binding": None,
         "replies": [],
         "initialized_at": None,
         "migration_notices": [],
@@ -76,6 +77,22 @@ def default_state():
         "message_windows": {},
         "pending": None,
     }
+
+
+def valid_conversation_binding(value):
+    return (
+        isinstance(value, dict)
+        and set(value) == {"schema", "conversation_id", "audience_id"}
+        and value.get("schema") == "rapp-messaging-bound-conversation/1.0"
+        and re.fullmatch(
+            r"conversation:[a-f0-9]{64}",
+            str(value.get("conversation_id") or ""),
+        )
+        and re.fullmatch(
+            r"audience:[a-f0-9]{64}",
+            str(value.get("audience_id") or ""),
+        )
+    )
 
 
 def fsync_directory(path):
@@ -134,6 +151,10 @@ def valid_state(data):
             pending.get("attempted_at") is None
             or isinstance(pending.get("attempted_at"), str)
         )
+        and (
+            pending.get("conversation_binding") is None
+            or valid_conversation_binding(pending.get("conversation_binding"))
+        )
     )
     return (
         isinstance(data, dict)
@@ -151,6 +172,10 @@ def valid_state(data):
             and len(value["text"]) <= 4000
             and isinstance(value.get("at"), str)
             for value in data.get("transcript", [])
+        )
+        and (
+            data.get("conversation_binding") is None
+            or valid_conversation_binding(data.get("conversation_binding"))
         )
         and isinstance(data.get("replies", []), list)
         and all(
@@ -534,6 +559,16 @@ def safe_text(value, limit):
 
 
 def respond(item, state, cfg):
+    expected_binding = voice_twin.google_voice_conversation_binding(cfg)
+    current_binding = state.get("conversation_binding")
+    if current_binding is None:
+        if state.get("transcript"):
+            state["transcript"] = []
+        state["conversation_binding"] = expected_binding
+    elif current_binding != expected_binding:
+        raise RuntimeError(
+            "Google Voice conversation binding changed; explicit migration required"
+        )
     return voice_twin.chat(
         item.get("_stable_message_id") or message_id(item),
         item.get("body", ""),
@@ -657,6 +692,19 @@ def _tick(*, reply_latest=False, responder=None, sender=deliver):
     cfg = config()
     items = collect(cfg)
     state = load_state()
+    expected_binding = voice_twin.google_voice_conversation_binding(cfg)
+    state_binding = state.get("conversation_binding")
+    if state_binding is not None and state_binding != expected_binding:
+        log("Google Voice conversation binding changed; refusing all processing")
+        return 0
+    if (
+        state_binding is None
+        and not state.get("pending")
+    ):
+        state["transcript"] = []
+        state["conversation_binding"] = expected_binding
+        state_binding = expected_binding
+        save_state(state)
     handled_order = list(dict.fromkeys(state.get("handled", [])))
     handled = set(handled_order)
     inbound_items = [item for item in items if eligible(item, cfg)]
@@ -701,6 +749,18 @@ def _tick(*, reply_latest=False, responder=None, sender=deliver):
 
     pending = state.get("pending")
     if pending:
+        if (
+            state_binding != expected_binding
+            or pending.get("conversation_binding") != expected_binding
+        ):
+            pending["delivery_state"] = "unknown"
+            pending["attempted_at"] = pending.get("attempted_at") or iso()
+            save_state(state)
+            log(
+                "pending delivery has no matching conversation binding; "
+                "refusing readback or send"
+            )
+            return 0
         count_delivery = (
             legacy_outbound_count
             if pending.get("delivery_state") is None
@@ -800,6 +860,7 @@ def _tick(*, reply_latest=False, responder=None, sender=deliver):
             "created_at": iso(),
             "delivery_state": "prepared",
             "attempted_at": None,
+            "conversation_binding": state["conversation_binding"],
         }
         state["pending"] = pending
         # The intent is durable BEFORE the irreversible send. A crash after

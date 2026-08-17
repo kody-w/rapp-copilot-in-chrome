@@ -25,6 +25,7 @@ voice_twin.FRAME_DIR = voice_twin.TWIN_ROOT / "frames"
 voice_twin.IDENTITY_FILE = voice_twin.TWIN_ROOT / "rappid.json"
 voice_twin.INSTALLATION_FILE = voice_twin.TWIN_ROOT / "installation.json"
 voice_twin.TRANSPORT_FILE = voice_twin.TWIN_ROOT / "transport-binding.json"
+voice_twin.BINDINGS_DIR = voice_twin.TWIN_ROOT / "bindings"
 voice_twin.SECRET_FILE = voice_twin.TWIN_ROOT / "transport-binding.key"
 voice_twin.MEMORY_FILE = voice_twin.TWIN_ROOT / "memory.json"
 voice_twin.LOCK_FILE = voice_twin.TWIN_ROOT / ".twin.lock"
@@ -77,10 +78,12 @@ original_run = voice_twin.subprocess.run
 voice_twin.subprocess.run = fake_run
 os.environ["SHOULD_NOT_REACH_TWIN"] = "secret"
 try:
+    conversation_binding = voice_twin.google_voice_conversation_binding(cfg)
     reply = voice_twin.chat(
         "a" * 20,
         "get Hacker News",
         {
+            "conversation_binding": conversation_binding,
             "transcript": [
                 {"role": "Owner", "text": "earlier"},
                 {"role": "Copilot", "text": "prior reply [#" + ("B" * 20) + "]"},
@@ -99,6 +102,41 @@ finally:
     voice_twin.subprocess.run = original_run
     os.environ.pop("SHOULD_NOT_REACH_TWIN", None)
 
+with voice_twin.twin_lock():
+    current_rappid = voice_twin.ensure_identity(cfg)
+    _, current_context = voice_twin.transport_context(
+        cfg,
+        current_rappid,
+        "c" * 20,
+    )
+assert voice_twin._conversation_history(
+    current_context,
+    "c" * 20,
+    {
+        "conversation_binding": conversation_binding,
+        "transcript": [
+            {"role": "Owner", "text": "bound legacy context"},
+        ],
+    },
+) == [{"role": "user", "content": "bound legacy context"}]
+mismatched_history = voice_twin._conversation_history(
+    current_context,
+    "c" * 20,
+    {
+        "conversation_binding": {
+            **conversation_binding,
+            "audience_id": "audience:" + ("f" * 64),
+        },
+        "transcript": [
+            {"role": "Owner", "text": "must not cross audiences"},
+        ],
+    },
+)
+assert all(
+    "must not cross audiences" not in row["content"]
+    for row in mismatched_history
+)
+
 assert len(calls) == 1, "a replay must return the durable twin result"
 assert "SHOULD_NOT_REACH_TWIN" not in calls[0][1]["env"]
 assert calls[0][1]["env"]["AGENTS_PATH"] == str(voice_twin.AGENTS_DIR)
@@ -112,6 +150,16 @@ assert set(manifest["agents"]) == {
 assert "copilot_cli_agent.py" not in manifest["agents"]
 assert "learn_new_agent.py" not in manifest["agents"]
 assert "imessage_agent.py" not in manifest["agents"]
+_, _, external_agents, external_tools = voice_twin._prepare_agents_profile(
+    cfg,
+    "public",
+)
+external_manifest = json.loads(
+    (external_agents / "manifest.json").read_text(encoding="utf-8")
+)
+assert "voice_twin_agent.py" not in external_manifest["agents"]
+assert "VoiceTwin" not in external_tools
+assert not (external_agents / "voice_twin_agent.py").exists()
 
 identity = json.loads(voice_twin.IDENTITY_FILE.read_text(encoding="utf-8"))
 assert rapp1.rappid_valid(identity["rappid"])
