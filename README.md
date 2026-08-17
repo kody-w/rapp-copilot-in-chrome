@@ -115,6 +115,23 @@ unique atomic temp files, directory fsync, a known-good backup, and a process lo
 runs Copilot silently in an empty sandbox with no tools, no built-in MCPs, and no repository
 instructions; transcript text is encoded as untrusted JSON and Unicode controls are stripped.
 
+The owner thread also exposes a deterministic infrastructure command center:
+`STATUS`, `INSPECT <name>`, `INVESTIGATE <name>`, `REPAIR <name>`,
+`REPAIRS`, `APPROVE <TOKEN>`, `CANCEL <TOKEN>`, `SNAPSHOT`, and `HELP`.
+A model never decides whether text authorized an action. There is no shell
+verb: `REPAIR` only creates a pending one-time token, and an exact explicit
+approval can execute only the infrastructure city's existing
+`launchd_restart` or `github_rerun` allowlists. Stable message IDs,
+per-message delivery correlation, and a durable command journal make
+crash/retry replay return the original result rather than repeat an effect.
+
+The command/approval boundary is transport-neutral. Google Voice web remains
+the single text leader; an optional Android adapter is Wi-Fi/VoIP-only and
+owns no text delivery or automated calling. Future WhatsApp or Discord
+adapters must implement the same typed observe/execute/reconcile contract and
+cannot parse commands, grant authority, share credentials, or retry effects
+independently.
+
 Example machine-local config (keep it mode `0600`):
 
 ```json
@@ -125,7 +142,9 @@ Example machine-local config (keep it mode `0600`):
   "google_voice_peer": "5558675309",
   "google_voice_owner": "Owner",
   "google_voice_model": "gpt-5.6-sol",
-  "max_replies_per_hour": 6
+  "max_replies_per_hour": 6,
+  "max_voice_actions_per_hour": 4,
+  "voice_evidence_stale_seconds": 900
 }
 ```
 
@@ -139,7 +158,8 @@ cd ~/.rappter-chrome/runtime
 python3 test_bridge.py           # 19 protocol/security/profile checks
 python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translations
 python3 test_gvoice.py           # cold start and stale-thread refusal
-python3 test_voice_assistant.py  # 39 crash, injection, identity assertions
+python3 test_voice_assistant.py  # crash, injection, identity assertions
+python3 test_voice_command_center.py # status/evidence/approval safety
 python3 test_install_local.py    # config, concurrency, rollback, SIGKILL recovery
 ```
 
@@ -290,6 +310,7 @@ bridge.py                         zero-dependency localhost WebSocket transport
 rappter_chrome_mcp.py             11-tool stdio MCP server
 gvoice.py                         account-locked Google Voice browser driver
 voice_assistant.py                persistent, verified Copilot SMS loop
+voice_command_center.py           evidence and one-time approval command grammar
 com.rapp.voice-assistant.plist.template  macOS resident service
 rappter-voice-assistant.service.template Linux user service
 test_bridge.py                    protocol and security tests

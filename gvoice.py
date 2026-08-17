@@ -77,6 +77,37 @@ SELECTORS = {
 }
 
 
+def trusted_voice_url(value):
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "voice.google.com"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and re.fullmatch(r"/u/\d+/messages/?", parsed.path) is not None
+    )
+
+
+def require_voice_url(value, label="Google Voice URL"):
+    if not trusted_voice_url(value):
+        raise BridgeError(f"{label} is not the exact https://voice.google.com origin")
+    return urllib.parse.urlsplit(value)
+
+
+def tab_url(c, tab):
+    value = next(
+        (item["url"] for item in c.tabs() if item["tabId"] == tab),
+        "",
+    )
+    require_voice_url(value, "current Google Voice tab")
+    return value
+
+
 def config():
     try:
         return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -117,7 +148,11 @@ def first_match(c, tab, kind, limit=40):
 def open_voice(c):
     want = expected_account()
     target_url = config().get("google_voice_url") or MESSAGES_URL
-    voice_tabs = [tab for tab in c.tabs() if "voice.google.com" in (tab.get("url") or "")]
+    require_voice_url(target_url, "configured Google Voice URL")
+    voice_tabs = [
+        tab for tab in c.tabs()
+        if trusted_voice_url(tab.get("url"))
+    ]
     accounts = {}
     tab = None
     for candidate in voice_tabs:
@@ -147,18 +182,16 @@ def open_voice(c):
 
     # Preserve /u/N from the tab selected above. Navigating an account-matched
     # /u/1 tab back to the hardcoded /u/0 URL silently switches identities.
-    current = next(
-        (item["url"] for item in c.tabs() if item["tabId"] == tab),
-        MESSAGES_URL,
-    )
-    parsed = urllib.parse.urlsplit(current)
+    current = tab_url(c, tab)
+    parsed = require_voice_url(current, "selected Google Voice tab")
     match = re.search(r"/u/\d+/messages", parsed.path)
     messages_url = (
-        f"{parsed.scheme}://{parsed.netloc}{match.group(0)}"
+        f"https://voice.google.com{match.group(0)}"
         if match
         else MESSAGES_URL
     )
     c.navigate(tab, messages_url)
+    tab_url(c, tab)
     # The app renders after the shell loads; waiting on the network is not
     # enough and a fixed sleep is either slow or flaky.
     for sel in SELECTORS["thread_list"]:
@@ -212,17 +245,28 @@ def pick(threads_list, who):
 
 
 def messages_url_for_tab(c, tab):
-    current = next(
-        (item["url"] for item in c.tabs() if item["tabId"] == tab),
-        MESSAGES_URL,
-    )
-    parsed = urllib.parse.urlsplit(current)
+    current = tab_url(c, tab)
+    parsed = require_voice_url(current, "Google Voice thread tab")
     match = re.search(r"/u/\d+/messages", parsed.path)
     return (
-        f"{parsed.scheme}://{parsed.netloc}{match.group(0)}"
+        f"https://voice.google.com{match.group(0)}"
         if match
         else MESSAGES_URL
     )
+
+
+def require_peer_thread(c, tab, peer):
+    digits = re.sub(r"\D", "", peer)
+    number = (
+        f"+{digits}"
+        if str(peer).strip().startswith("+")
+        else f"+1{digits[-10:]}"
+    )
+    current = tab_url(c, tab)
+    query = urllib.parse.parse_qs(urllib.parse.urlsplit(current).query)
+    if query.get("itemId") != [f"t.{number}"]:
+        raise BridgeError("Google Voice did not remain on the configured peer thread")
+    return number
 
 
 def wait_for_thread(c, tab, attempts=60, delay=0.25):
@@ -257,6 +301,7 @@ def open_thread(c, tab, who):
             raise BridgeError(
                 f"Google Voice thread for {number} did not render within 15 seconds"
             )
+        require_peer_thread(c, tab, who)
         return {"who": number, "i": None}
 
     sel, tl = threads(c, tab)
@@ -388,10 +433,12 @@ def send(c, tab, who, text, confirm=True):
         f"""(() => [...document.querySelectorAll(
           'gv-message-item,[data-e2e-is-outgoing]'
         )].filter(n => {{
+          const normalize = value => String(value || '')
+            .replace(/\\s+/g, ' ').trim();
           const mine = !!n.querySelector('.outgoing')
             || n.getAttribute('data-e2e-is-outgoing') === 'true'
             || String(n.className || '').includes('outgoing');
-          return mine && (n.innerText || '').includes({want});
+          return mine && normalize(n.innerText).includes(normalize({want}));
         }}).length)()""",
     )
 
@@ -425,10 +472,12 @@ def send(c, tab, who, text, confirm=True):
             f"""(() => [...document.querySelectorAll(
               'gv-message-item,[data-e2e-is-outgoing]'
             )].filter(n => {{
+              const normalize = value => String(value || '')
+                .replace(/\\s+/g, ' ').trim();
               const mine = !!n.querySelector('.outgoing')
                 || n.getAttribute('data-e2e-is-outgoing') === 'true'
                 || String(n.className || '').includes('outgoing');
-              return mine && (n.innerText || '').includes({want});
+              return mine && normalize(n.innerText).includes(normalize({want}));
             }}).length)()""",
         )
         if count > before:

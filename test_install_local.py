@@ -164,3 +164,49 @@ recovered = subprocess.run(
 )
 assert recovered.returncode == 0, recovered.stderr
 print(recovered.stdout.strip())
+
+# SIGKILL after journaling but before the first rename must leave the intact
+# previous runtime in place. A prepared backup path does not prove a swap ran.
+preswap_home = pathlib.Path(tempfile.mkdtemp(prefix="rappter-install-preswap-"))
+preswap_env = {**os.environ, "HOME": str(preswap_home)}
+baseline = subprocess.run(
+    [sys.executable, str(root / "install_local.py"), "--no-open"],
+    capture_output=True,
+    text=True,
+    env=preswap_env,
+)
+assert baseline.returncode == 0, baseline.stderr
+preswap_targets = (
+    preswap_home / ".rappter-chrome" / "runtime",
+    preswap_home / ".rappter-chrome" / "extension",
+    preswap_home / ".copilot" / "skills" / "rappter-chrome-local",
+)
+for target in preswap_targets:
+    (target / "old-marker").write_text("old")
+
+preswap_script = textwrap.dedent(
+    f"""
+    import argparse, importlib.util, os
+    spec = importlib.util.spec_from_file_location(
+        "installer", {str(root / "install_local.py")!r}
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    def die_before_swap(stage, destination, backup=None):
+        os._exit(78)
+    module.swap_dir = die_before_swap
+    module.install(argparse.Namespace(keep_legacy=False, no_open=True))
+    """
+)
+killed = subprocess.run([sys.executable, "-c", preswap_script], env=preswap_env)
+assert killed.returncode == 78
+recovered = subprocess.run(
+    [sys.executable, "-c", recover_script],
+    capture_output=True,
+    text=True,
+    env=preswap_env,
+)
+assert recovered.returncode == 0, recovered.stderr
+for target in preswap_targets:
+    assert (target / "old-marker").read_text() == "old"
+print("pre-swap SIGKILL recovery passed")

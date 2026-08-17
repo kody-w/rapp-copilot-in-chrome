@@ -29,6 +29,7 @@ sys.path.insert(0, str(HERE))
 
 from bridge import BridgeError, Chrome  # noqa: E402
 import gvoice  # noqa: E402
+import voice_command_center  # noqa: E402
 
 CONFIG_FILE = Path.home() / ".rappter-chrome" / "config.json"
 STATE_FILE = Path.home() / ".rappter-chrome" / "voice-assistant-state.json"
@@ -66,6 +67,10 @@ def default_state():
         "transcript": [],
         "replies": [],
         "initialized_at": None,
+        "migration_notices": [],
+        "message_rows": {},
+        "message_rows_initialized": False,
+        "message_sequence": 0,
         "pending": None,
     }
 
@@ -104,11 +109,66 @@ def write_json_atomic(path, data):
 
 
 def valid_state(data):
+    pending = data.get("pending")
+    pending_valid = pending is None or (
+        isinstance(pending, dict)
+        and re.fullmatch(r"[a-f0-9]{20}", str(pending.get("message_id") or ""))
+        and isinstance(pending.get("inbound_text"), str)
+        and len(pending["inbound_text"]) <= 4000
+        and isinstance(pending.get("reply"), str)
+        and len(pending["reply"]) <= 900
+        and isinstance(pending.get("baseline"), int)
+        and not isinstance(pending.get("baseline"), bool)
+        and pending["baseline"] >= 0
+        and isinstance(pending.get("created_at"), str)
+    )
     return (
         isinstance(data, dict)
         and isinstance(data.get("handled", []), list)
+        and all(
+            re.fullmatch(r"[a-f0-9]{20}", str(value or ""))
+            for value in data.get("handled", [])
+        )
         and isinstance(data.get("transcript", []), list)
+        and all(
+            isinstance(value, dict)
+            and isinstance(value.get("role"), str)
+            and len(value["role"]) <= 80
+            and isinstance(value.get("text"), str)
+            and len(value["text"]) <= 4000
+            and isinstance(value.get("at"), str)
+            for value in data.get("transcript", [])
+        )
         and isinstance(data.get("replies", []), list)
+        and all(
+            isinstance(value, dict)
+            and re.fullmatch(
+                r"[a-f0-9]{20}",
+                str(value.get("message_id") or ""),
+            )
+            and isinstance(value.get("at"), str)
+            for value in data.get("replies", [])
+        )
+        and isinstance(data.get("message_rows", {}), dict)
+        and all(
+            re.fullmatch(r"[a-f0-9]{24}", str(signature or ""))
+            and isinstance(values, list)
+            and all(
+                re.fullmatch(r"[a-f0-9]{20}", str(value or ""))
+                for value in values
+            )
+            for signature, values in data.get("message_rows", {}).items()
+        )
+        and isinstance(data.get("message_rows_initialized", False), bool)
+        and isinstance(data.get("migration_notices", []), list)
+        and all(
+            re.fullmatch(r"[a-f0-9]{20}", str(value or ""))
+            for value in data.get("migration_notices", [])
+        )
+        and isinstance(data.get("message_sequence", 0), int)
+        and not isinstance(data.get("message_sequence", 0), bool)
+        and data.get("message_sequence", 0) >= 0
+        and pending_valid
     )
 
 
@@ -183,6 +243,12 @@ def config():
         "google_voice_owner": cfg.get("google_voice_owner", "the owner"),
         "google_voice_model": cfg.get("google_voice_model", "gpt-5.6-sol"),
         "max_replies_per_hour": int(cfg.get("max_replies_per_hour", 6)),
+        "max_voice_actions_per_hour": int(
+            cfg.get("max_voice_actions_per_hour", 4)
+        ),
+        "voice_evidence_stale_seconds": int(
+            cfg.get("voice_evidence_stale_seconds", 900)
+        ),
     }
 
 
@@ -232,6 +298,49 @@ def message_id(item):
     return hashlib.sha256(material.encode()).hexdigest()[:20]
 
 
+def message_signature(item):
+    material = (
+        f"{item['direction']}|{item['from']}|"
+        f"{canonical_identity(item)}|{safe_text(item.get('body'), 4000)}"
+    )
+    return hashlib.sha256(material.encode()).hexdigest()[:24]
+
+
+def assign_message_ids(state, items):
+    rows = state.setdefault("message_rows", {})
+    sequence = int(state.get("message_sequence", 0))
+    grouped = {}
+    for index, item in enumerate(items):
+        grouped.setdefault(message_signature(item), []).append(index)
+    assigned = [None] * len(items)
+    changed = False
+    for signature, indexes in grouped.items():
+        old_ids = [
+            value for value in rows.get(signature, [])
+            if re.fullmatch(r"[a-f0-9]{20}", str(value or ""))
+        ]
+        if len(indexes) <= len(old_ids):
+            current_ids = old_ids[-len(indexes):] if indexes else []
+        else:
+            current_ids = list(old_ids)
+            for _ in range(len(indexes) - len(old_ids)):
+                sequence += 1
+                current_ids.append(
+                    hashlib.sha256(
+                        f"{signature}|{sequence}".encode()
+                    ).hexdigest()[:20]
+                )
+        if rows.get(signature) != current_ids:
+            rows[signature] = current_ids
+            changed = True
+        for index, stable_id in zip(indexes, current_ids):
+            assigned[index] = stable_id
+    if state.get("message_sequence") != sequence:
+        state["message_sequence"] = sequence
+        changed = True
+    return list(zip(assigned, items)), changed
+
+
 def canonical_identity(item):
     if item.get("identity"):
         return item["identity"]
@@ -251,7 +360,7 @@ def eligible(item, cfg):
         return False
     text = item.get("body", "")
     return not re.search(
-        r"verification code|security code|one[- ]time|do not share|\\b2fa\\b",
+        r"verification code|security code|one[- ]time|do not share|\b2fa\b",
         text,
         re.I,
     )
@@ -393,41 +502,70 @@ def call_copilot(item, state, cfg):
     return validate_reply(result.stdout)
 
 
+def respond(item, state, cfg):
+    reply = voice_command_center.handle(
+        item.get("_stable_message_id") or message_id(item),
+        item.get("body", ""),
+        state,
+        cfg,
+    )
+    return reply if reply is not None else call_copilot(item, state, cfg)
+
+
+def delivery_text(reply, stable_message_id):
+    marker = f" [#{stable_message_id.upper()}]"
+    clean = safe_text(reply, 900).strip()
+    if clean.endswith(marker):
+        return clean
+    return clean[: 900 - len(marker)].rstrip() + marker
+
+
 def collect(cfg):
-    with Chrome() as chrome:
-        tab = gvoice.open_voice(chrome)
-        gvoice.open_thread(chrome, tab, cfg["google_voice_peer"])
-        items = gvoice.messages(chrome, tab)
-        # Inside a directly addressed thread Voice abbreviates inbound rows to
-        # "Message from ," and omits the number that was visible in the list.
-        # The thread itself was opened with the configured peer, so that is the
-        # authoritative sender for otherwise-empty inbound rows.
-        for item in items:
-            if item.get("direction") == "inbound" and not item.get("from"):
-                item["from"] = cfg["google_voice_peer"]
-        return items
+    try:
+        with Chrome() as chrome:
+            tab = gvoice.open_voice(chrome)
+            gvoice.open_thread(chrome, tab, cfg["google_voice_peer"])
+            items = gvoice.messages(chrome, tab)
+            gvoice.require_peer_thread(
+                chrome,
+                tab,
+                cfg["google_voice_peer"],
+            )
+            # Inside a directly addressed thread Voice abbreviates inbound
+            # rows to "Message from ," and omits the number that was visible
+            # in the list. The configured thread is authoritative here.
+            for item in items:
+                if item.get("direction") == "inbound" and not item.get("from"):
+                    item["from"] = cfg["google_voice_peer"]
+            return items
+    except SystemExit as exc:
+        raise RuntimeError(f"Google Voice read failed: {exc}") from exc
 
 
 def deliver(cfg, text):
-    with Chrome() as chrome:
-        tab = gvoice.open_voice(chrome)
-        result = gvoice.send(
-            chrome,
-            tab,
-            cfg["google_voice_peer"],
-            text,
-            confirm=True,
-        )
-        if not result.get("verified"):
-            raise RuntimeError("Google Voice did not confirm the reply")
+    try:
+        with Chrome() as chrome:
+            tab = gvoice.open_voice(chrome)
+            result = gvoice.send(
+                chrome,
+                tab,
+                cfg["google_voice_peer"],
+                text,
+                confirm=True,
+            )
+            if not result.get("verified"):
+                raise RuntimeError("Google Voice did not confirm the reply")
+    except SystemExit as exc:
+        raise RuntimeError(f"Google Voice send failed: {exc}") from exc
 
 
 def outbound_count(items, text):
+    wanted = " ".join(safe_text(text, 900).split())
     return sum(
         1
         for item in items
         if item.get("direction") == "outbound"
-        and safe_text(item.get("body"), 900) == safe_text(text, 900)
+        and " ".join(safe_text(item.get("body"), 900).split()) == wanted
     )
 
 
@@ -454,17 +592,51 @@ def finalize_delivery(state, pending, handled_order, handled, cfg):
     state["transcript"] = state["transcript"][-40:]
     state.setdefault("replies", []).append({"at": iso(), "message_id": mid})
     state["replies"] = state["replies"][-100:]
+    state["migration_notices"] = [
+        value
+        for value in state.get("migration_notices", [])
+        if value != mid
+    ]
     state["pending"] = None
     save_state(state)
 
 
-def _tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
+def _tick(*, reply_latest=False, responder=None, sender=deliver):
+    responder = responder or respond
     cfg = config()
     items = collect(cfg)
     state = load_state()
     handled_order = list(dict.fromkeys(state.get("handled", [])))
     handled = set(handled_order)
-    inbound = [(message_id(item), item) for item in items if eligible(item, cfg)]
+    inbound_items = [item for item in items if eligible(item, cfg)]
+    rows_initialized = state.get("message_rows_initialized", False)
+    inbound, rows_changed = assign_message_ids(state, inbound_items)
+    migration_notices = set(state.get("migration_notices", []))
+    if not rows_initialized:
+        state["message_rows_initialized"] = True
+        if state.get("initialized_at"):
+            ambiguous = []
+            for mid, item in inbound:
+                legacy_id = message_id(item)
+                if legacy_id in handled:
+                    ambiguous.append((mid, item))
+            for mid, _ in ambiguous[:-1]:
+                if mid not in handled:
+                    handled_order.append(mid)
+                    handled.add(mid)
+            if ambiguous:
+                migration_notices.add(ambiguous[-1][0])
+            state["migration_notices"] = sorted(migration_notices)
+            state["handled"] = handled_order
+            save_state(state)
+            log(
+                f"migrated stable message IDs: mapped "
+                f"{len(handled)} handled inbound messages"
+            )
+    elif rows_changed:
+        # Persist new stable IDs before generation or side effects so a crash
+        # cannot assign different identities to the same visible rows.
+        save_state(state)
 
     pending = state.get("pending")
     if pending:
@@ -523,7 +695,19 @@ def _tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
     replied = 0
     for mid, item in candidates[:budget]:
         try:
-            reply = responder(item, state, cfg)
+            if mid in migration_notices:
+                reply = (
+                    "Upgrade safety check: I could not prove whether your "
+                    "latest visible message was already handled. No command "
+                    "was run. Please resend anything still pending."
+                )
+            else:
+                reply = responder(
+                    {**item, "_stable_message_id": mid},
+                    state,
+                    cfg,
+                )
+            reply = delivery_text(reply, mid)
         except Exception as exc:
             log(f"reply generation failed for {mid}: {type(exc).__name__}: {exc}")
             continue
@@ -550,10 +734,14 @@ def _tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
             break
         replied += 1
         log(f"replied and verified: {mid}")
+        # The verified send changed the outbound baseline. Re-read before
+        # another identical reply can reserve a stale count and later be
+        # mistaken for a delivery that never happened.
+        items = collect(cfg)
     return replied
 
 
-def tick(*, reply_latest=False, responder=call_copilot, sender=deliver):
+def tick(*, reply_latest=False, responder=None, sender=deliver):
     with tick_lock() as acquired:
         if not acquired:
             log("another Voice tick owns the state lock — skipping")

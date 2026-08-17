@@ -2,6 +2,7 @@
 """Focused regressions for account cold-start and thread render failures."""
 
 import json
+import inspect
 import pathlib
 import tempfile
 
@@ -52,6 +53,29 @@ cold = ColdChrome()
 assert gvoice.open_voice(cold) == 7
 assert cold.opened == 7
 assert cold.url == "https://voice.google.com/u/3/messages"
+assert gvoice.trusted_voice_url("https://voice.google.com/u/3/messages")
+assert not gvoice.trusted_voice_url(
+    "https://voice.google.com.attacker.example/u/3/messages"
+)
+assert not gvoice.trusted_voice_url("http://voice.google.com/u/3/messages")
+
+gvoice.CONFIG_FILE.write_text(json.dumps({
+    "google_voice_account": "expected@example.com",
+    "google_voice_url": "https://voice.google.com.attacker.example/u/3/messages",
+}))
+try:
+    gvoice.open_voice(ColdChrome())
+    raise AssertionError("attacker-controlled Voice origin must be refused")
+except BridgeError as exc:
+    assert "exact https://voice.google.com origin" in str(exc)
+gvoice.CONFIG_FILE.write_text(
+    json.dumps(
+        {
+            "google_voice_account": "expected@example.com",
+            "google_voice_url": "https://voice.google.com/u/3/messages",
+        }
+    )
+)
 
 
 class StaleChrome:
@@ -78,5 +102,8 @@ try:
         assert "did not render" in str(exc)
 finally:
     gvoice.time.sleep = original_sleep
+
+send_source = inspect.getsource(gvoice.send)
+assert "normalize(n.innerText).includes(normalize(" in send_source
 
 print("Google Voice: cold-start + stale-thread regressions passed")
