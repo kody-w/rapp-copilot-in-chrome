@@ -3,7 +3,7 @@
   "status": "structural-pre-acceptance",
   "rapp_1": {
     "authority_repository": "kody-w/rapp-1",
-    "authority_commit": "6723c7add2aed36bb68992fc71a56b0a4bd5ad81",
+    "authority_commit": "d2cd5abed48d3f52b86bbb975ac3558286d1db41",
     "reference_file": "rapp1.py",
     "reference_sha256": "c945ee85f01af5cd374490b40721d07f2aca7c8bd6d209e0d2933420f55db284",
     "implemented": [
