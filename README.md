@@ -136,7 +136,7 @@ python3 ~/.rappter-chrome/runtime/build_voice_twin_egg.py
 ```
 
 The pinned rev-5 reference is byte-identical to
-`kody-w/rapp-1@6723c7a`. The implementation reports
+`kody-w/rapp-1@d2cd5ab`. The implementation reports
 `structural-pre-acceptance`, not full/authenticated RAPP/1 conformance:
 registered genesis/trust, exact section-8 facade acceptance, and a Google Voice
 transport profile remain open at
