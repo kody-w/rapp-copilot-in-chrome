@@ -179,6 +179,8 @@ def _restore(journal):
         subprocess.run(
             ["launchctl", "kickstart", "-p", launch_target()],
             check=True,
+            capture_output=True,
+            text=True,
         )
         if not service_loaded():
             raise RuntimeError("previous understudy service did not recover")
@@ -262,6 +264,8 @@ def install():
             subprocess.run(
                 ["launchctl", "kickstart", "-p", launch_target()],
                 check=True,
+                capture_output=True,
+                text=True,
             )
             verify_loaded()
             journal["phase"] = "committed"
