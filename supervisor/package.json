@@ -1,0 +1,11 @@
+{
+  "name": "rapp-chrome-supervisor",
+  "version": "1.0.0",
+  "description": "Resilient proxy in front of the real Claude-in-Chrome bridge: forwards every tool call as-is, and only retries/restarts the underlying bridge process when a call looks hung or timed out.",
+  "type": "module",
+  "main": "server.js",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}

@@ -19,6 +19,7 @@ authenticated sessions. Not a throwaway headless instance.
 ```
 Copilot CLI (MCP client)
   -> ~/.copilot/bin/rapp-copilot-in-chrome        (launcher shim)
+  -> rapp-chrome-supervisor/server.js             (resilience proxy -- retries/restarts on hang)
   -> claude --claude-in-chrome-mcp                (self-contained stdio MCP server)
   -> native host com.anthropic.claude_code_browser_extension
   -> Chrome extension fcoeoabgfenejglbffodgkkbkcdhcgfn
@@ -29,6 +30,11 @@ The MCP server is self-contained: it does **not** require a Claude Code session 
 needs only the Claude binary (which hosts the bridge) plus the Chrome extension installed and
 connected. That is the whole trick — the bridge was always a plain stdio MCP server, so any MCP
 client can drive it.
+
+The supervisor step forwards every call unchanged and only intervenes on a hang/timeout-looking
+error: one retry on the same connection, then a full restart of the underlying bridge process if
+still stuck, throttled to 3 restarts per 2 minutes. It's optional (needs Node.js) and the launcher
+falls straight back to talking to the bridge directly without it. See the README for details.
 
 ## Run this — do not improvise
 
@@ -144,6 +150,7 @@ in.
 | Server missing | `copilot mcp get rapp-copilot-in-chrome` should report `Status: Enabled`. |
 | Cannot locate `claude` | Set `RAPP_CHROME_CLAUDE_BIN` to its absolute path. |
 | Browser not responding | Extension may be disconnected — `list_connected_browsers`, then `select_browser` or `switch_browser`. |
+| A call hangs/times out repeatedly | The supervisor already retries and restarts once automatically. If a response mentions the bridge was restarted, call `tabs_context_mcp` again before anything else — tab/browser selection was reset. |
 
 Run `python3 rapp_copilot_in_chrome_agent.py '{"action": "doctor"}'` before debugging by hand — it
 names the exact broken link in the chain.

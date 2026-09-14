@@ -12,7 +12,9 @@ Recommended — local extension, local stdio MCP, no vendor account:
 curl -fsSL https://raw.githubusercontent.com/kody-w/rapp-copilot-in-chrome/main/install-local.sh | sh
 ```
 
-The reverse-engineered Claude bridge remains available as a compatibility backend:
+The reverse-engineered Claude bridge remains available as a compatibility backend — now with an
+auto-restart supervisor in front of it so a hung page or an unresponsive bridge process gets
+recovered automatically instead of stalling the session:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kody-w/rapp-copilot-in-chrome/main/install.sh | sh
@@ -255,6 +257,7 @@ Full chain:
 ```
 Copilot CLI (MCP client)
   -> ~/.copilot/bin/rapp-copilot-in-chrome        (launcher shim)
+  -> rapp-chrome-supervisor/server.js             (resilience proxy -- optional, on by default)
   -> claude --claude-in-chrome-mcp                (self-contained stdio MCP server)
   -> native host com.anthropic.claude_code_browser_extension
   -> Chrome extension fcoeoabgfenejglbffodgkkbkcdhcgfn
@@ -265,6 +268,35 @@ Chrome's native-messaging manifest lives at
 `~/Library/Application Support/Google/Chrome/NativeMessagingHosts/com.anthropic.claude_code_browser_extension.json`
 and points at a shim that execs the Claude binary with `--chrome-native-host`. That is the extension
 side. The `--claude-in-chrome-mcp` side is the client side, and it is the one worth borrowing.
+
+### The resilience supervisor
+
+The bridge is genuinely the best browser-driving engine available here — real accessibility-tree
+clicking, real screenshots, a sane permission model — but a long session can still hit a page (or a
+chat widget, or a busy tab) that makes a single call hang for tens of seconds, or leaves the bridge
+itself unresponsive until something restarts it.
+
+`supervisor/server.js` sits between the launcher and the bridge and forwards every call through
+unchanged. It only steps in when a call's response matches a known hang/timeout signature (`did not
+respond in time`, `Script injection timed out`, `unresponsive`, a CDP command timeout, etc.):
+
+1. Retry the exact same call once on the existing connection (covers a transiently busy page).
+2. If it's still hung, kill and restart the underlying `claude --claude-in-chrome-mcp` process,
+   reconnect, and retry once more.
+3. Restarts are throttled to 3 within a rolling 2-minute window. Past that, the real error is
+   returned with a note instead of restarting again — a persistent failure should be visible, not
+   silently retried forever.
+
+Explicit errors that a restart can't fix (a denied permission prompt, "not connected", a bad
+selector, a real page error) are passed straight through with no retry.
+
+A restart drops the bridge's in-process state (selected browser, open tab IDs) since it's a fresh
+process — the supervisor labels its response when that happens so the calling agent knows to call
+`tabs_context_mcp` again.
+
+It's installed automatically by `action: "install"` when Node.js and npm are on `PATH`, and it's
+fully optional: with no supervisor present, or with `RAPP_CHROME_NO_SUPERVISOR=1` set, the launcher
+falls straight back to talking to the bridge directly, exactly as it did before this existed.
 
 ## How it was found
 
@@ -281,6 +313,8 @@ side. The `--claude-in-chrome-mcp` side is the client side, and it is the one wo
 - The **Claude in Chrome** extension installed and connected.
 - **Copilot CLI**, and **Python 3.9+** for the installer.
 - macOS or Linux.
+- Optional: **Node.js + npm** on `PATH` to get the resilience supervisor (see above). Without it the
+  installer just skips that step and the bridge is used directly, same as before.
 
 If your Claude binary is somewhere unusual, set `RAPP_CHROME_CLAUDE_BIN` to its absolute path.
 
@@ -290,7 +324,7 @@ If your Claude binary is somewhere unusual, set `RAPP_CHROME_CLAUDE_BIN` to its 
 python3 rapp_copilot_in_chrome_agent.py '{"action": "doctor"}'
 ```
 
-`doctor` checks all seven links in the chain and finishes with a live round trip into a real tab:
+`doctor` checks all eight links in the chain and finishes with a live round trip into a real tab:
 
 ```
 [ok] claude binary (hosts the bridge) -- /Users/you/.local/bin/claude
@@ -298,6 +332,7 @@ python3 rapp_copilot_in_chrome_agent.py '{"action": "doctor"}'
 [ok] Chrome extension fcoeoabgfenejglbffodgkkbkcdhcgfn -- installed
 [ok] launcher /Users/you/.copilot/bin/rapp-copilot-in-chrome -- executable
 [ok] MCP server registered -- registered in /Users/you/.copilot/mcp-config.json
+[ok] resilience supervisor (auto-restart on hang) -- active
 [ok] bridge answers MCP -- 22 tools
 [ok] Chrome reachable (live round trip) -- tab group reachable
 ```
@@ -368,6 +403,9 @@ NO DRIFT — path-independent, idempotent, and fixed-point stable in every direc
 SKILL.md                          toasted skill — the browser-usage guide
 rapp_copilot_in_chrome_agent.py   toasted agent — install / status / doctor / uninstall
 bin/rapp-copilot-in-chrome        launcher shim installed into ~/.copilot/bin
+supervisor/server.js              resilience proxy: auto-retry/restart the bridge on hangs
+supervisor/package.json           its one dependency (@modelcontextprotocol/sdk)
+supervisor/package-lock.json       pinned dependency tree for reproducible installs
 docs/tools.json                   JSON Schemas for all 22 tools
 install.sh                        Claude compatibility installer
 install-local.sh                  vendorless installer

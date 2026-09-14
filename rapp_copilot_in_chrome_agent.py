@@ -67,6 +67,9 @@ COPILOT_DIR = os.path.join(HOME, ".copilot")
 BIN_PATH = os.path.join(COPILOT_DIR, "bin", SERVER_NAME)
 MCP_CONFIG = os.path.join(COPILOT_DIR, "mcp-config.json")
 SKILL_DIR = os.path.join(COPILOT_DIR, "skills", SERVER_NAME)
+SUPERVISOR_NAME = "rapp-chrome-supervisor"
+SUPERVISOR_DIR = os.path.join(COPILOT_DIR, "mcp-servers", SUPERVISOR_NAME)
+SUPERVISOR_ENTRY = os.path.join(SUPERVISOR_DIR, "server.js")
 
 LAUNCHER = """#!/bin/sh
 # rapp-copilot-in-chrome -- stdio MCP server bridging Copilot CLI to Chrome.
@@ -86,6 +89,15 @@ if [ -z "$CLAUDE_BIN" ] || [ ! -x "$CLAUDE_BIN" ]; then
   echo "rapp-copilot-in-chrome: cannot locate the 'claude' binary that hosts the browser bridge." >&2
   echo "Install Claude Code, or set RAPP_CHROME_CLAUDE_BIN to its absolute path." >&2
   exit 127
+fi
+
+# Prefer the resilience supervisor: it forwards every call to the real
+# bridge unchanged, and only retries/restarts it when a call looks hung.
+# Falls back to talking to the bridge directly if the supervisor isn't
+# installed (older install, node missing) or is explicitly disabled.
+SUPERVISOR="$HOME/.copilot/mcp-servers/rapp-chrome-supervisor/server.js"
+if [ "$RAPP_CHROME_NO_SUPERVISOR" != "1" ] && [ -f "$SUPERVISOR" ] && command -v node >/dev/null 2>&1; then
+  exec node "$SUPERVISOR" "$CLAUDE_BIN"
 fi
 
 exec "$CLAUDE_BIN" --claude-in-chrome-mcp
@@ -276,6 +288,28 @@ def _probe(timeout=45, live=False):
     return out
 
 
+def _install_supervisor(repo_dir):
+    """Best-effort install of the resilience supervisor. Never fatal: the
+    launcher already falls back to talking to the bridge directly if this
+    isn't present or `node` isn't available."""
+    src_dir = os.path.join(repo_dir, "supervisor")
+    if not os.path.isdir(src_dir) or not shutil.which("node") or not shutil.which("npm"):
+        return None
+    try:
+        os.makedirs(SUPERVISOR_DIR, exist_ok=True)
+        for name in ("server.js", "package.json", "package-lock.json"):
+            src = os.path.join(src_dir, name)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(SUPERVISOR_DIR, name))
+        subprocess.run(
+            ["npm", "install", "--omit=dev", "--silent"],
+            cwd=SUPERVISOR_DIR, check=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120)
+        return "installed resilience supervisor to %s" % SUPERVISOR_DIR
+    except (OSError, subprocess.SubprocessError):
+        return "supervisor install skipped (non-fatal; falling back to direct bridge)"
+
+
 def _do_install(skill_src_dir):
     steps = []
 
@@ -284,6 +318,10 @@ def _do_install(skill_src_dir):
         fh.write(LAUNCHER)
     os.chmod(BIN_PATH, 0o755)
     steps.append("wrote launcher %s" % BIN_PATH)
+
+    supervisor_step = _install_supervisor(os.path.dirname(os.path.abspath(__file__)))
+    if supervisor_step:
+        steps.append(supervisor_step)
 
     cfg = _read_mcp_config(strict=True)
     cfg.setdefault("mcpServers", {})[SERVER_NAME] = {
@@ -317,6 +355,9 @@ def _do_uninstall():
     if os.path.isdir(SKILL_DIR):
         shutil.rmtree(SKILL_DIR)
         steps.append("removed skill %s" % SKILL_DIR)
+    if os.path.isdir(SUPERVISOR_DIR):
+        shutil.rmtree(SUPERVISOR_DIR)
+        steps.append("removed resilience supervisor %s" % SUPERVISOR_DIR)
     return steps or ["nothing to remove; already uninstalled"]
 
 
@@ -397,6 +438,8 @@ class RappCopilotInChromeAgent(BasicAgent):
         extension = _extension_installed()
         registered = SERVER_NAME in _read_mcp_config().get("mcpServers", {})
         launcher_ok = os.access(BIN_PATH, os.X_OK)
+        supervisor_present = os.path.exists(SUPERVISOR_ENTRY)
+        node_available = bool(shutil.which("node"))
 
         checks = [
             {"check": "claude binary (hosts the bridge)", "ok": bool(claude),
@@ -412,6 +455,13 @@ class RappCopilotInChromeAgent(BasicAgent):
             {"check": "MCP server registered", "ok": registered,
              "detail": ("registered in %s" % MCP_CONFIG) if registered
                        else "not registered -- run action 'install'"},
+            {"check": "resilience supervisor (auto-restart on hang)",
+             "ok": True,  # optional layer; the launcher degrades gracefully without it
+             "detail": ("active" if supervisor_present and node_available else
+                        "installed but 'node' not on PATH -- falling back to direct bridge"
+                        if supervisor_present else
+                        "not installed (optional) -- direct bridge has no auto-restart; "
+                        "run action 'install' with Node.js available to enable it")},
         ]
 
         probe = {}

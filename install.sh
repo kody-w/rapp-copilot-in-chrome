@@ -36,6 +36,11 @@ else
       exit 1
     fi
   done
+  mkdir -p "$WORKDIR/supervisor"
+  for f in supervisor/server.js supervisor/package.json supervisor/package-lock.json; do
+    curl -fsSL "$RAW/$f" -o "$WORKDIR/$f" || true  # optional -- resilience layer degrades gracefully
+    [ -s "$WORKDIR/$f" ] || rm -f "$WORKDIR/$f"     # drop empty/failed downloads
+  done
   AGENT="$WORKDIR/rapp_copilot_in_chrome_agent.py"
 fi
 
