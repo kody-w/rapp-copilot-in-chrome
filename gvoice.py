@@ -77,6 +77,44 @@ SELECTORS = {
 }
 
 
+def trusted_voice_url(value):
+    """True only for the exact https://voice.google.com messages origin.
+
+    Substring checks like ``"voice.google.com" in url`` accept lookalike
+    origins such as ``https://voice.google.com.attacker.example/...`` and
+    ``https://voice.google.com@evil/...``. This validates scheme, host, port,
+    the absence of userinfo, and the /u/N/messages path shape.
+    """
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname == "voice.google.com"
+        and port in (None, 443)
+        and parsed.username is None
+        and parsed.password is None
+        and re.fullmatch(r"/u/\d+/messages/?", parsed.path) is not None
+    )
+
+
+def require_voice_url(value, label="Google Voice URL"):
+    if not trusted_voice_url(value):
+        raise BridgeError(f"{label} is not the exact https://voice.google.com origin")
+    return urllib.parse.urlsplit(value)
+
+
+def tab_url(c, tab):
+    value = next(
+        (item["url"] for item in c.tabs() if item["tabId"] == tab),
+        "",
+    )
+    require_voice_url(value, "current Google Voice tab")
+    return value
+
+
 def config():
     try:
         return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
@@ -92,14 +130,24 @@ def expected_account():
     ).strip().lower()
 
 
+def account_from_label(label):
+    # Require exactly one email in the account chip. A page that injects a
+    # second address to create ambiguity yields "" (mismatch) rather than
+    # letting an attacker-chosen address slip through.
+    emails = re.findall(
+        r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}",
+        str(label or ""),
+    )
+    return emails[0].lower() if len(emails) == 1 else ""
+
+
 def account_for_tab(c, tab):
     label = c.eval(
         tab,
         """document.querySelector('[aria-label^="Google Account:"]')
              ?.getAttribute('aria-label') || ''""",
     )
-    match = re.search(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", label or "")
-    return match.group(0).lower() if match else ""
+    return account_from_label(label)
 
 
 def first_match(c, tab, kind, limit=40):
@@ -117,7 +165,11 @@ def first_match(c, tab, kind, limit=40):
 def open_voice(c):
     want = expected_account()
     target_url = config().get("google_voice_url") or MESSAGES_URL
-    voice_tabs = [tab for tab in c.tabs() if "voice.google.com" in (tab.get("url") or "")]
+    require_voice_url(target_url, "configured Google Voice URL")
+    voice_tabs = [
+        tab for tab in c.tabs()
+        if trusted_voice_url(tab.get("url"))
+    ]
     accounts = {}
     tab = None
     for candidate in voice_tabs:
@@ -147,23 +199,28 @@ def open_voice(c):
 
     # Preserve /u/N from the tab selected above. Navigating an account-matched
     # /u/1 tab back to the hardcoded /u/0 URL silently switches identities.
-    current = next(
-        (item["url"] for item in c.tabs() if item["tabId"] == tab),
-        MESSAGES_URL,
-    )
-    parsed = urllib.parse.urlsplit(current)
+    # The origin is always rebuilt from the trusted literal, never from the
+    # tab's own netloc — a lookalike tab cannot smuggle its host through here.
+    current = tab_url(c, tab)
+    parsed = require_voice_url(current, "selected Google Voice tab")
     match = re.search(r"/u/\d+/messages", parsed.path)
     messages_url = (
-        f"{parsed.scheme}://{parsed.netloc}{match.group(0)}"
+        f"https://voice.google.com{match.group(0)}"
         if match
         else MESSAGES_URL
     )
     c.navigate(tab, messages_url)
+    tab_url(c, tab)
     # The app renders after the shell loads; waiting on the network is not
     # enough and a fixed sleep is either slow or flaky.
     for sel in SELECTORS["thread_list"]:
         try:
             c.waitfor(tab, sel, timeout=12000)
+            post_account = account_for_tab(c, tab)
+            if want and post_account != want:
+                raise SystemExit(
+                    "Google Voice account changed during navigation; refusing"
+                )
             return tab
         except BridgeError:
             continue
@@ -212,14 +269,11 @@ def pick(threads_list, who):
 
 
 def messages_url_for_tab(c, tab):
-    current = next(
-        (item["url"] for item in c.tabs() if item["tabId"] == tab),
-        MESSAGES_URL,
-    )
-    parsed = urllib.parse.urlsplit(current)
+    current = tab_url(c, tab)
+    parsed = require_voice_url(current, "Google Voice thread tab")
     match = re.search(r"/u/\d+/messages", parsed.path)
     return (
-        f"{parsed.scheme}://{parsed.netloc}{match.group(0)}"
+        f"https://voice.google.com{match.group(0)}"
         if match
         else MESSAGES_URL
     )

@@ -1,10 +1,16 @@
 # rapp-copilot-in-chrome
 
-**Drive your real, logged-in Edge/Chrome from GitHub Copilot CLI.**
+**Drive your real, logged-in Chromium browser — Edge, Chrome, or Brave — from GitHub Copilot CLI.**
 
 Not a headless throwaway browser — *your* browser, with your profile, your cookies, and your
 authenticated sessions. Navigate, click, type, screenshot, read the accessibility tree, run
 JavaScript, and inspect console and network traffic, all from Copilot CLI.
+
+> **Browser support.** This is a Chromium bridge, not Chrome-only. It works with any
+> Chromium-based browser that loads an unpacked MV3 extension — **Microsoft Edge, Google
+> Chrome, Brave, and Chromium**. The `chrome` in the name is historical (the boundary was
+> first reverse-engineered against Chrome); the code and installer detect and drive whichever
+> of these you have. (Non-Chromium browsers such as Firefox and Safari are not supported.)
 
 Recommended — local extension, local stdio MCP, no vendor account:
 
@@ -30,7 +36,7 @@ Copilot CLI
   -> ~/.rappter-chrome/runtime/rappter_chrome_mcp.py
   -> localhost WebSocket (127.0.0.1 only)
   -> unpacked MV3 extension
-  -> your real Edge/Chrome tabs
+  -> your real Edge / Chrome / Brave tabs
 ```
 
 The extension **dials out**. That inversion removes the native-messaging manifest, browser restart,
@@ -42,7 +48,7 @@ Claude binary, and claude.ai login in one move: nothing needs to spawn a native 
 | Vendor account | none | matching claude.ai login |
 | Native messaging manifest | none | required |
 | Python packages | none (stdlib) | none |
-| Browser | Edge or Chrome | Claude extension's supported browsers |
+| Browser | Any Chromium browser — Edge, Chrome, Brave, or Chromium | Claude extension's supported browsers |
 
 ### Install
 
