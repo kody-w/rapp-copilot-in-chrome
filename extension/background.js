@@ -178,7 +178,7 @@ async function handleMessage(sock, raw, auth, token) {
 }
 
 // Classic MV3 workers load these locally; no remote code or vendor runtime.
-importScripts("cdp.js", "capture.js", "perception.js", "assertions.js");
+importScripts("cdp.js", "capture.js", "perception.js", "assertions.js", "input.js", "forms.js", "observe.js");
 
 // ── page-side functions ─────────────────────────────────────────────────────
 // These are DECLARED functions handed to chrome.scripting, never strings run
@@ -203,32 +203,6 @@ function _click(selector, index) {
   el.scrollIntoView({ block: "center" });
   el.click();
   return { clicked: selector, matched: els.length };
-}
-
-function _type(selector, text, submit) {
-  const el = document.querySelector(selector);
-  if (!el) throw new Error(`no element for ${selector}`);
-  el.focus();
-  const proto = el instanceof HTMLTextAreaElement
-    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-  // React and friends listen for the native setter, not for .value =. Without
-  // this, text appears in the box and the app never sees it — the field looks
-  // filled and submits empty.
-  if (setter && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
-    setter.call(el, text);
-  } else if (el.isContentEditable) {
-    el.textContent = text;
-  } else {
-    el.value = text;
-  }
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  el.dispatchEvent(new Event("change", { bubbles: true }));
-  if (submit) {
-    el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-  }
-  return { typed: text.length, selector };
 }
 
 function _query(selector, limit) {
@@ -397,7 +371,19 @@ async function dispatch(cmd, a) {
       return await inPage(a.tabId, _click, [a.selector, a.index]);
 
     case "type":
-      return await inPage(a.tabId, _type, [a.selector, a.text, !!a.submit]);
+      return await formInput(a);
+
+    case "input":
+      return await browserInput(a);
+
+    case "observe_start":
+      return await observeStart(a);
+
+    case "observe_read":
+      return await observeRead(a);
+
+    case "observe_stop":
+      return await observeStop(a);
 
     case "waitfor":
       return await inPage(a.tabId, _waitFor, [a.selector, a.timeout]);

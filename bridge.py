@@ -429,8 +429,46 @@ class Chrome:
         return self.call("find", tabId=tab, exact=exact, limit=limit, **criteria)
     def click(self, tab, selector, index=0):
         return self.call("click", tabId=tab, selector=selector, index=index)
-    def type(self, tab, selector, text, submit=False):
-        return self.call("type", tabId=tab, selector=selector, text=text, submit=submit)
+    def type(self, tab, selector, text, submit=False, *, index=None, by=None):
+        """Set a control value; optional index/by support indexed and select controls."""
+        options = {
+            key: value for key, value in (("index", index), ("by", by))
+            if value is not None
+        }
+        return self.call("type", tabId=tab, selector=selector, text=text, submit=submit, **options)
+    def form_input(self, tab, selector, value, submit=False, *, index=None, by=None):
+        """Set text, checked boolean, numeric value, or a list of select values/labels."""
+        return self.type(tab, selector, value, submit, index=index, by=by)
+    def input(self, tab, action, **options):
+        """Native input; options use transport camelCase (clickCount, deltaX/deltaY).
+
+        Target with x/y, selector/index, or ref; type/key may use current focus.
+        Text is at most 1 MiB UTF-8; modifiers are ctrl/cmd/shift/alt (not type).
+        """
+        return self.call("input", tabId=tab, action=action, **options)
+    def observe_start(self, tab, kind, *, max_events=500, max_bytes=1048576,
+                      include_headers=None, include_bodies=None, max_body_bytes=None):
+        """Opt in to bounded console/network capture, holding the debugger until stop.
+
+        No history is guaranteed. Sensitive URLs/logs go to the caller; headers
+        and bodies require explicit opt-in. Worker-memory buffers reset on
+        navigation, stop, detach, or worker eviction. Network flags are invalid
+        for console; max_body_bytes requires include_bodies=True.
+        """
+        options = {
+            key: value for key, value in (
+                ("includeHeaders", include_headers), ("includeBodies", include_bodies),
+                ("maxBodyBytes", max_body_bytes),
+            ) if value is not None
+        }
+        return self.call("observe_start", tabId=tab, kind=kind,
+                         maxEvents=max_events, maxBytes=max_bytes, **options)
+    def observe_read(self, tab, kind, clear=False):
+        """Read the bounded observation snapshot; do not clear unless requested."""
+        return self.call("observe_read", tabId=tab, kind=kind, clear=clear)
+    def observe_stop(self, tab, kind):
+        """Return the final snapshot, discard its buffer, and release its debugger hold."""
+        return self.call("observe_stop", tabId=tab, kind=kind)
     def waitfor(self, tab, selector, timeout=15000):
         return self.call("waitfor", tabId=tab, selector=selector, timeout=timeout)
     def assert_page(self, tab, condition, *, selector=None, text=None, pattern=None, timeout=0):

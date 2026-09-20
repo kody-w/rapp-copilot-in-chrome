@@ -15,6 +15,34 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridge import BridgeError, Chrome  # noqa: E402
 
 
+MAX_SAFE_INTEGER = 9007199254740991
+SAFE_ID_SCHEMA = {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INTEGER}
+INPUT_TARGET_KEYS = ("x", "y", "selector", "index", "ref")
+INPUT_TARGET_SCHEMAS = [
+    {
+        "required": list(required),
+        "not": {"anyOf": [{"required": [key]} for key in INPUT_TARGET_KEYS
+                         if key not in allowed]},
+    }
+    for required, allowed in [
+        (("x", "y"), ("x", "y")),
+        (("selector",), ("selector", "index")),
+        (("ref",), ("ref",)),
+    ]
+]
+OBSERVATION_POLICY = (
+    "Opt-in capture only; no historical data guarantees. Default network "
+    "metadata omits headers and bodies; headers and bodies require explicit "
+    "opt-in; request bodies are never retained. URLs and console log messages may contain sensitive data. "
+    "Returned data goes to the MCP caller. Buffers are bounded in worker "
+    "memory, reset on top-document navigation/reload, and discarded on stop, "
+    "tab closure, debugger detach, or worker eviction. Same-document history "
+    "does not reset buffers. An active session holds the debugger until stop "
+    "or lifecycle termination; navigation keeps capture active. Flags govern "
+    "extension retention/output, not browser caches or transient CDP payloads. "
+)
+
+
 TOOLS = [
     {
         "name": "tabs_context_mcp",
@@ -80,16 +108,28 @@ TOOLS = [
     },
     {
         "name": "form_input",
-        "description": "Set a form field through its native value setter.",
+        "description": (
+            "Set a form control using native setters and input/change events. "
+            "Strings fill text controls; booleans set checked state; numbers "
+            "set native typed values; arrays of strings select multiple options. "
+            "Use by:value (default) or by:label for select options, and an "
+            "optional zero-based selector index. submit defaults to false."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "tabId": {"type": "integer"},
-                "selector": {"type": "string"},
-                "value": {"type": "string"},
-                "submit": {"type": "boolean"},
+                "tabId": SAFE_ID_SCHEMA,
+                "selector": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "value": {"oneOf": [
+                    {"type": "string"}, {"type": "boolean"}, {"type": "number"},
+                    {"type": "array", "items": {"type": "string"}},
+                ]},
+                "submit": {"type": "boolean", "default": False},
+                "index": {**SAFE_ID_SCHEMA, "default": 0},
+                "by": {"type": "string", "enum": ["value", "label"], "default": "value"},
             },
             "required": ["tabId", "selector", "value"],
+            "additionalProperties": False,
         },
     },
     {
@@ -299,6 +339,172 @@ TOOLS = [
             ],
         },
     },
+    {
+        "name": "input",
+        "description": (
+            "Send native browser input via the debugger: click, hover, scroll, "
+            "type, or key. Mouse actions require exactly one target: viewport "
+            "CSS x/y, selector with optional zero-based index, or a main-document "
+            "DOM ref from accessibility perception. Type/key optionally target "
+            "an element, otherwise use focus. Text is limited to 1 MiB UTF-8. "
+            "Modifiers ctrl/cmd/shift/alt are allowed except for type. Printable "
+            "key/Shift mappings use a US layout; type handles Unicode text. "
+            "Common macOS editing shortcuts include native commands listed in "
+            "editingCommands; other combinations dispatch key events only. "
+            "Dispatch success is not proof of application outcome."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "action": {
+                    "type": "string", "enum": ["click", "hover", "scroll", "type", "key"],
+                },
+                "x": {"type": "number", "minimum": 0, "maximum": 1000000},
+                "y": {"type": "number", "minimum": 0, "maximum": 1000000},
+                "selector": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "index": {**SAFE_ID_SCHEMA, "default": 0},
+                "ref": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "button": {
+                    "type": "string", "enum": ["left", "right", "middle"], "default": "left",
+                },
+                "clickCount": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+                "deltaX": {
+                    "type": "number", "minimum": -1000000, "maximum": 1000000, "default": 0,
+                },
+                "deltaY": {
+                    "type": "number", "minimum": -1000000, "maximum": 1000000, "default": 0,
+                },
+                "text": {
+                    "type": "string", "maxLength": 1048576,
+                    "description": "At most 1048576 bytes when encoded as UTF-8.",
+                },
+                "key": {
+                    "type": "string", "minLength": 1,
+                    "description": "A single character or supported named key, such as Enter.",
+                },
+                "modifiers": {
+                    "type": "array", "uniqueItems": True,
+                    "items": {"type": "string", "enum": ["ctrl", "cmd", "shift", "alt"]},
+                },
+            },
+            "required": ["tabId", "action"],
+            "additionalProperties": False,
+            "allOf": [
+                {
+                    "if": {"properties": {"action": {"enum": ["click", "hover", "scroll"]}}},
+                    "then": {"oneOf": INPUT_TARGET_SCHEMAS},
+                    "else": {"oneOf": [
+                        *INPUT_TARGET_SCHEMAS,
+                        {"not": {"anyOf": [{"required": [key]} for key in INPUT_TARGET_KEYS]}},
+                    ]},
+                },
+                *[
+                    {
+                        "if": {"properties": {"action": {"const": action}}},
+                        "then": {
+                            **({"required": required} if required else {}),
+                            "not": {"anyOf": [{"required": [key]} for key in
+                                             ("button", "clickCount", "deltaX", "deltaY",
+                                              "text", "key", "modifiers")
+                                             if key not in allowed]},
+                        },
+                    }
+                    for action, required, allowed in [
+                        ("click", [], ("button", "clickCount", "modifiers")),
+                        ("hover", [], ("modifiers",)),
+                        ("scroll", [], ("deltaX", "deltaY", "modifiers")),
+                        ("type", ["text"], ("text",)),
+                        ("key", ["key"], ("key", "modifiers")),
+                    ]
+                ],
+                {
+                    "if": {"properties": {"action": {"const": "scroll"}}},
+                    "then": {"anyOf": [
+                        {"required": [key], "properties": {key: {"not": {"const": 0}}}}
+                        for key in ("deltaX", "deltaY")
+                    ]},
+                },
+            ],
+        },
+    },
+    {
+        "name": "observe_start",
+        "description": (
+            "Start bounded console or network observation for a tab. " + OBSERVATION_POLICY
+            + "Network includeHeaders/includeBodies default false. maxBodyBytes "
+            "applies only when includeBodies is true and caps retained decoded/UTF-8 "
+            "bytes, not transient CDP transfers. Body retrieval is asynchronous; "
+            "inspect pendingBodies before stopping. Console rejects network flags."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "kind": {"type": "string", "enum": ["console", "network"]},
+                "maxEvents": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 500},
+                "maxBytes": {
+                    "type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576,
+                },
+                "includeHeaders": {"type": "boolean", "default": False},
+                "includeBodies": {"type": "boolean", "default": False},
+                "maxBodyBytes": {
+                    "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536,
+                },
+            },
+            "required": ["tabId", "kind"],
+            "additionalProperties": False,
+            "allOf": [
+                {
+                    "if": {"properties": {"kind": {"const": "console"}}},
+                    "then": {"not": {"anyOf": [
+                        {"required": [key]}
+                        for key in ("includeHeaders", "includeBodies", "maxBodyBytes")
+                    ]}},
+                },
+                {
+                    "if": {"required": ["maxBodyBytes"]},
+                    "then": {
+                        "required": ["includeBodies"],
+                        "properties": {"includeBodies": {"const": True}},
+                    },
+                },
+            ],
+        },
+    },
+    {
+        "name": "observe_read",
+        "description": (
+            "Read an active observation snapshot without clearing by default; "
+            "clear:true drains the current buffer. " + OBSERVATION_POLICY
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "kind": {"type": "string", "enum": ["console", "network"]},
+                "clear": {"type": "boolean", "default": False},
+            },
+            "required": ["tabId", "kind"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "observe_stop",
+        "description": (
+            "Stop an active observation, return its final snapshot and discard "
+            "the buffer, releasing its debugger hold. " + OBSERVATION_POLICY
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "kind": {"type": "string", "enum": ["console", "network"]},
+            },
+            "required": ["tabId", "kind"],
+            "additionalProperties": False,
+        },
+    },
 ]
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
 
@@ -315,6 +521,11 @@ NEW_COMMANDS = {
     "find_elements": "find",
     "wait_for": "waitfor",
     "assert_page": "assert",
+    "input": "input",
+    "observe_start": "observe_start",
+    "observe_read": "observe_read",
+    "observe_stop": "observe_stop",
+    "form_input": "type",
 }
 
 
@@ -344,7 +555,154 @@ def string_arg(args, key, nonempty=False):
     return value
 
 
+def only_args(args, allowed):
+    unknown = set(args) - set(allowed)
+    if unknown:
+        raise BridgeError(f"unsupported or inapplicable arguments: {', '.join(sorted(unknown))}")
+
+
+def finite_number_arg(args, key, minimum=None, maximum=None, default=None):
+    value = args.get(key, default)
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise BridgeError(f"{key} must be a finite number")
+    if minimum is not None and value < minimum:
+        raise BridgeError(f"{key} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise BridgeError(f"{key} must be at most {maximum}")
+    return value
+
+
+def input_arguments(args):
+    action = string_arg(args, "action")
+    payloads = {
+        "click": ("button", "clickCount", "modifiers"),
+        "hover": ("modifiers",),
+        "scroll": ("deltaX", "deltaY", "modifiers"),
+        "type": ("text",),
+        "key": ("key", "modifiers"),
+    }
+    if action not in payloads:
+        raise BridgeError(f"unsupported input action: {action}")
+    only_args(args, ("tabId", "action", *INPUT_TARGET_KEYS, *payloads[action]))
+    out = {"tabId": integer_arg(args, "tabId", minimum=0, maximum=MAX_SAFE_INTEGER),
+           "action": action}
+    targets = sum(("x" in args or "y" in args, "selector" in args, "ref" in args))
+    if targets > 1 or (action in ("click", "hover", "scroll") and targets != 1):
+        raise BridgeError("input requires exactly one target for mouse actions, at most one otherwise")
+    if "index" in args and "selector" not in args:
+        raise BridgeError("index is only allowed with selector")
+    if "x" in args or "y" in args:
+        out.update({key: finite_number_arg(args, key, 0, 1000000) for key in ("x", "y")})
+    elif "selector" in args:
+        out.update(
+            selector=string_arg(args, "selector", nonempty=True),
+            index=integer_arg(args, "index", 0, 0, MAX_SAFE_INTEGER),
+        )
+    elif "ref" in args:
+        out["ref"] = string_arg(args, "ref", nonempty=True)
+    if "modifiers" in args:
+        modifiers = args["modifiers"]
+        if (
+            not isinstance(modifiers, list)
+            or any(not isinstance(value, str) or value not in ("ctrl", "cmd", "shift", "alt")
+                   for value in modifiers)
+            or len(set(modifiers)) != len(modifiers)
+        ):
+            raise BridgeError("modifiers must be a unique array of ctrl, cmd, shift, alt")
+        out["modifiers"] = list(modifiers)
+    if action == "click":
+        button = args.get("button", "left")
+        if button not in ("left", "right", "middle"):
+            raise BridgeError("button must be left, right, or middle")
+        out.update(button=button, clickCount=integer_arg(args, "clickCount", 1, 1, 3))
+    elif action == "scroll":
+        out.update({key: finite_number_arg(args, key, -1000000, 1000000, 0)
+                    for key in ("deltaX", "deltaY")})
+        if not out["deltaX"] and not out["deltaY"]:
+            raise BridgeError("scroll requires at least one nonzero deltaX or deltaY")
+    elif action == "type":
+        text = string_arg(args, "text")
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise BridgeError("text must be valid UTF-8") from exc
+        if size > 1048576:
+            raise BridgeError("text exceeds 1 MiB UTF-8")
+        out["text"] = text
+    elif action == "key":
+        key = string_arg(args, "key")
+        if not key:
+            raise BridgeError("key must be a nonempty string")
+        out["key"] = key
+    return out
+
+
+def observation_arguments(name, args):
+    allowed = ["tabId", "kind"]
+    if name == "observe_start":
+        allowed += ["maxEvents", "maxBytes", "includeHeaders", "includeBodies", "maxBodyBytes"]
+    elif name == "observe_read":
+        allowed += ["clear"]
+    only_args(args, allowed)
+    kind = string_arg(args, "kind")
+    if kind not in ("console", "network"):
+        raise BridgeError("kind must be console or network")
+    out = {"tabId": integer_arg(args, "tabId", minimum=0, maximum=MAX_SAFE_INTEGER),
+           "kind": kind}
+    if name == "observe_start":
+        out.update(
+            maxEvents=integer_arg(args, "maxEvents", 500, 1, 5000),
+            maxBytes=integer_arg(args, "maxBytes", 1048576, 1024, 8388608),
+        )
+        if kind == "console":
+            only_args(args, ("tabId", "kind", "maxEvents", "maxBytes"))
+        else:
+            out.update(includeHeaders=boolean_arg(args, "includeHeaders"),
+                       includeBodies=boolean_arg(args, "includeBodies"))
+            if "maxBodyBytes" in args and not out["includeBodies"]:
+                raise BridgeError("maxBodyBytes requires includeBodies:true")
+            if out["includeBodies"]:
+                out["maxBodyBytes"] = integer_arg(args, "maxBodyBytes", 65536, 1, 1048576)
+    elif name == "observe_read":
+        out["clear"] = boolean_arg(args, "clear")
+    return out
+
+
+def form_arguments(args):
+    only_args(args, ("tabId", "selector", "value", "submit", "index", "by"))
+    value = args.get("value")
+    if type(value) in (int, float):
+        finite_number_arg(args, "value")
+    elif not isinstance(value, (str, bool)) and not (
+        isinstance(value, list) and all(isinstance(item, str) for item in value)
+    ):
+        raise BridgeError("value must be a string, boolean, finite number, or array of strings")
+    out = {
+        "tabId": integer_arg(args, "tabId", minimum=0, maximum=MAX_SAFE_INTEGER),
+        "selector": string_arg(args, "selector", nonempty=True),
+        "text": value,
+        "submit": boolean_arg(args, "submit"),
+    }
+    if "index" in args:
+        out["index"] = integer_arg(args, "index", minimum=0, maximum=MAX_SAFE_INTEGER)
+    if "by" in args:
+        if args["by"] not in ("value", "label"):
+            raise BridgeError("by must be value or label")
+        out["by"] = args["by"]
+    return out
+
+
 def new_command(name, args):
+    if name == "input":
+        return {"cmd": NEW_COMMANDS[name], "args": input_arguments(args)}
+    if name.startswith("observe_"):
+        return {"cmd": NEW_COMMANDS[name], "args": observation_arguments(name, args)}
+    if name == "form_input":
+        return {"cmd": NEW_COMMANDS[name], "args": form_arguments(args)}
     command_args = {"tabId": integer_arg(args, "tabId", minimum=0)}
     if name == "read_page_ax":
         command_args.update(
@@ -439,16 +797,6 @@ def batch_step(name, args):
                 },
             }
         return {"cmd": "text", "args": {"tabId": args["tabId"]}}
-    if name == "form_input":
-        return {
-            "cmd": "type",
-            "args": {
-                "tabId": args["tabId"],
-                "selector": args["selector"],
-                "text": args["value"],
-                "submit": args.get("submit", False),
-            },
-        }
     if name == "computer":
         action = args["action"]
         if action == "click":
@@ -536,6 +884,29 @@ class Server:
 
         chrome = self.connection()
 
+        if name in ("input", "observe_start", "observe_read", "observe_stop", "form_input"):
+            options = dict(translated["args"])
+            tab = options.pop("tabId")
+            if name == "input":
+                return chrome.input(tab, options.pop("action"), **options)
+            if name == "form_input":
+                return chrome.form_input(
+                    tab, options.pop("selector"), options.pop("text"), **options,
+                )
+            kind = options.pop("kind")
+            if name == "observe_start":
+                for camel, snake in (
+                    ("maxEvents", "max_events"), ("maxBytes", "max_bytes"),
+                    ("includeHeaders", "include_headers"), ("includeBodies", "include_bodies"),
+                    ("maxBodyBytes", "max_body_bytes"),
+                ):
+                    if camel in options:
+                        options[snake] = options.pop(camel)
+                return chrome.observe_start(tab, kind, **options)
+            if name == "observe_read":
+                return chrome.observe_read(tab, kind, **options)
+            return chrome.observe_stop(tab, kind)
+
         if name in NEW_COMMANDS:
             return chrome.call(translated["cmd"], **translated["args"])
 
@@ -554,14 +925,6 @@ class Server:
                     args.get("limit", 40),
                 )
             return chrome.text(args["tabId"])
-
-        if name == "form_input":
-            return chrome.type(
-                args["tabId"],
-                args["selector"],
-                args["value"],
-                args.get("submit", False),
-            )
 
         if name == "computer":
             action = args["action"]
