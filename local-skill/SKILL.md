@@ -19,12 +19,29 @@ Prefer `browser_batch` for ordered multi-step work.
 
 - `tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`
 - `navigate`
-- `get_page_text`, `read_page`
+- `get_page_text`, `read_page` (existing text/CSS readers)
+- `read_page_ax`, `find_elements` (native accessibility snapshot and role/name/text matching)
+- `wait_for` (CSS presence), `assert_page` (visible, enabled, text-contains, url-matches)
 - `form_input`
 - `computer` (`click`, `type`, `activate`, `screenshot`)
 - `javascript_tool`
 - `browser_batch`
 - `list_connected_browsers`
+
+`computer` screenshots accept `fullPage: true` or a `region` with CSS-page
+`x`, `y`, `width`, and `height`; optional `scale` controls CDP output size.
+Screenshots are MCP image blocks, including inside `browser_batch`.
+The default remains a visible-tab screenshot.
+
+Accessibility references are scoped to a document and invalidate on navigation
+or reload. `find_elements` is deterministic matching, not natural-language
+understanding. Re-read after navigation; existing click/type tools still use CSS
+selectors, not accessibility references.
+
+Assertions return `passed: false` on unmet conditions and are marked as MCP
+errors, including in batches. Inspect their structured results before acting.
+`list_connected_browsers` reports the actual extension instance ID and profile
+label; it does not discover every browser installed on the machine.
 
 ## Safety
 

@@ -404,6 +404,7 @@ class Chrome:
 
     # -- the verbs --
     def ping(self):                        return self.call("ping")
+    def browser_info(self):                return self.call("browser_info")
     def tabs(self):                        return self.call("tabs")
     def find_tab(self, match):             return self.call("find_tab", match=match)
     def create(self, url=None, active=False, timeout=20000):
@@ -416,15 +417,39 @@ class Chrome:
     def html(self, tab):                   return self.call("html", tabId=tab)
     def query(self, tab, selector, limit=40):
         return self.call("query", tabId=tab, selector=selector, limit=limit)
+    def read_page_ax(self, tab, limit=1000, include_ignored=False):
+        return self.call(
+            "read_page_ax", tabId=tab, limit=limit, includeIgnored=include_ignored,
+        )
+    def find_elements(self, tab, *, role=None, name=None, text=None, exact=False, limit=40):
+        criteria = {
+            key: value for key, value in (("role", role), ("name", name), ("text", text))
+            if value is not None
+        }
+        return self.call("find", tabId=tab, exact=exact, limit=limit, **criteria)
     def click(self, tab, selector, index=0):
         return self.call("click", tabId=tab, selector=selector, index=index)
     def type(self, tab, selector, text, submit=False):
         return self.call("type", tabId=tab, selector=selector, text=text, submit=submit)
     def waitfor(self, tab, selector, timeout=15000):
         return self.call("waitfor", tabId=tab, selector=selector, timeout=timeout)
+    def assert_page(self, tab, condition, *, selector=None, text=None, pattern=None, timeout=0):
+        criteria = {
+            key: value
+            for key, value in (("selector", selector), ("text", text), ("pattern", pattern))
+            if value is not None
+        }
+        return self.call("assert", tabId=tab, condition=condition, timeout=timeout, **criteria)
     def eval(self, tab, code, await_promise=True):
         return self.call("eval", tabId=tab, code=code, awaitPromise=await_promise)
-    def screenshot(self, tab):             return self.call("screenshot", tabId=tab)
+    def screenshot(self, tab, *, full_page=None, region=None, scale=None):
+        """Capture the viewport, or use optional CSS page-coordinate capture options."""
+        options = {
+            key: value
+            for key, value in (("fullPage", full_page), ("region", region), ("scale", scale))
+            if value is not None
+        }
+        return self.call("screenshot", tabId=tab, **options)
     def batch(self, actions):              return self.call("batch", actions=actions)
 
     def open(self, url, reuse=True):
