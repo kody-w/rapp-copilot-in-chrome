@@ -1,12 +1,46 @@
 #!/usr/bin/env python3
 """Vendorless stdio MCP server for the Rappter Chromium extension."""
 
+import base64
+import binascii
 import json
+import math
+import struct
 import sys
+import urllib.parse
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bridge import BridgeError, Chrome  # noqa: E402
+
+
+MAX_SAFE_INTEGER = 9007199254740991
+SAFE_ID_SCHEMA = {"type": "integer", "minimum": 0, "maximum": MAX_SAFE_INTEGER}
+INPUT_TARGET_KEYS = ("x", "y", "selector", "index", "ref")
+INPUT_TARGET_SCHEMAS = [
+    {
+        "required": list(required),
+        "not": {"anyOf": [{"required": [key]} for key in INPUT_TARGET_KEYS
+                         if key not in allowed]},
+    }
+    for required, allowed in [
+        (("x", "y"), ("x", "y")),
+        (("selector",), ("selector", "index")),
+        (("ref",), ("ref",)),
+    ]
+]
+OBSERVATION_POLICY = (
+    "Opt-in capture only; no historical data guarantees. Default network "
+    "metadata omits headers and bodies; headers and bodies require explicit "
+    "opt-in; request bodies are never retained. URLs and console log messages may contain sensitive data. "
+    "Returned data goes to the MCP caller. Buffers are bounded in worker "
+    "memory, reset on top-document navigation/reload, and discarded on stop, "
+    "tab closure, debugger detach, or worker eviction. Same-document history "
+    "does not reset buffers. An active session holds the debugger until stop "
+    "or lifecycle termination; navigation keeps capture active. Flags govern "
+    "extension retention/output, not browser caches or transient CDP payloads. "
+)
 
 
 TOOLS = [
@@ -74,16 +108,28 @@ TOOLS = [
     },
     {
         "name": "form_input",
-        "description": "Set a form field through its native value setter.",
+        "description": (
+            "Set a form control using native setters and input/change events. "
+            "Strings fill text controls; booleans set checked state; numbers "
+            "set native typed values; arrays of strings select multiple options. "
+            "Use by:value (default) or by:label for select options, and an "
+            "optional zero-based selector index. submit defaults to false."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "tabId": {"type": "integer"},
-                "selector": {"type": "string"},
-                "value": {"type": "string"},
-                "submit": {"type": "boolean"},
+                "tabId": SAFE_ID_SCHEMA,
+                "selector": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "value": {"oneOf": [
+                    {"type": "string"}, {"type": "boolean"}, {"type": "number"},
+                    {"type": "array", "items": {"type": "string"}},
+                ]},
+                "submit": {"type": "boolean", "default": False},
+                "index": {**SAFE_ID_SCHEMA, "default": 0},
+                "by": {"type": "string", "enum": ["value", "label"], "default": "value"},
             },
             "required": ["tabId", "selector", "value"],
+            "additionalProperties": False,
         },
     },
     {
@@ -92,7 +138,7 @@ TOOLS = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "tabId": {"type": "integer"},
+                "tabId": {"type": "integer", "minimum": 0},
                 "action": {
                     "type": "string",
                     "enum": ["click", "type", "activate", "screenshot"],
@@ -101,8 +147,43 @@ TOOLS = [
                 "text": {"type": "string"},
                 "index": {"type": "integer"},
                 "submit": {"type": "boolean"},
+                "fullPage": {
+                    "type": "boolean",
+                    "description": (
+                        "Capture the full page (screenshot only); true cannot "
+                        "be combined with region."
+                    ),
+                },
+                "region": {
+                    "type": "object",
+                    "description": "Screenshot crop in CSS page coordinates.",
+                    "properties": {
+                        "x": {"type": "number", "minimum": 0},
+                        "y": {"type": "number", "minimum": 0},
+                        "width": {"type": "number", "exclusiveMinimum": 0},
+                        "height": {"type": "number", "exclusiveMinimum": 0},
+                    },
+                    "required": ["x", "y", "width", "height"],
+                    "additionalProperties": False,
+                },
+                "scale": {
+                    "type": "number",
+                    "exclusiveMinimum": 0,
+                    "maximum": 2,
+                    "description": "Screenshot scale, greater than zero and at most 2.",
+                },
             },
             "required": ["tabId", "action"],
+            "allOf": [{
+                "if": {
+                    "properties": {
+                        "action": {"const": "screenshot"},
+                        "fullPage": {"const": True},
+                    },
+                    "required": ["fullPage"],
+                },
+                "then": {"not": {"required": ["region"]}},
+            }],
         },
     },
     {
@@ -140,8 +221,289 @@ TOOLS = [
     },
     {
         "name": "list_connected_browsers",
-        "description": "Report the connected local Chromium browser.",
+        "description": "Query the live browser's instance, profile, and connection state.",
         "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_page_ax",
+        "description": (
+            "Read the tab's main-document accessibility tree, bounded by a "
+            "node limit; child frames are excluded. "
+            "References are document-scoped and invalidated by navigation "
+            "or reload. Text is whitespace-normalized AX value plus exposed "
+            "descendant StaticText names (InlineTextBox fallback), in tree "
+            "order; accessible labels alone are not text."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer", "minimum": 0},
+                "limit": {
+                    "type": "integer", "minimum": 1, "maximum": 5000,
+                    "default": 1000,
+                },
+                "includeIgnored": {"type": "boolean", "default": False},
+            },
+            "required": ["tabId"],
+        },
+    },
+    {
+        "name": "find_elements",
+        "description": (
+            "Find main-document accessible elements matching all supplied "
+            "role, name, and text criteria; child frames are excluded. Use literal, "
+            "case-insensitive, whitespace-normalized matching. Role matches "
+            "exactly; name/text use substrings unless exact. Text is AX value "
+            "plus exposed descendant StaticText names (InlineTextBox fallback), "
+            "in tree order; accessible labels alone are not text. "
+            "References are document-scoped and invalidated by navigation "
+            "or reload."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer", "minimum": 0},
+                "role": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "name": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "text": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "exact": {"type": "boolean", "default": False},
+                "limit": {
+                    "type": "integer", "minimum": 1, "maximum": 5000,
+                    "default": 40,
+                },
+            },
+            "required": ["tabId"],
+            "anyOf": [
+                {"required": ["role"]},
+                {"required": ["name"]},
+                {"required": ["text"]},
+            ],
+        },
+    },
+    {
+        "name": "wait_for",
+        "description": "Wait for a CSS selector to exist; timeout is milliseconds.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer", "minimum": 0},
+                "selector": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "timeout": {
+                    "type": "integer", "minimum": 1, "maximum": 30000,
+                    "default": 15000,
+                },
+            },
+            "required": ["tabId", "selector"],
+        },
+    },
+    {
+        "name": "assert_page",
+        "description": (
+            "Assert visible, enabled, text-contains, or url-matches. Unmet "
+            "assertions return passed:false and a tool error. Timeout is "
+            "milliseconds; zero checks immediately. URL patterns are "
+            "JavaScript regular expression source, without slash delimiters."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": {"type": "integer", "minimum": 0},
+                "condition": {
+                    "type": "string",
+                    "enum": ["visible", "enabled", "text-contains", "url-matches"],
+                },
+                "selector": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "text": {"type": "string"},
+                "pattern": {"type": "string"},
+                "timeout": {
+                    "type": "integer", "minimum": 0, "maximum": 30000,
+                    "default": 0,
+                },
+            },
+            "required": ["tabId", "condition"],
+            "allOf": [
+                {
+                    "if": {"properties": {"condition": {
+                        "enum": ["visible", "enabled", "text-contains"],
+                    }}},
+                    "then": {"required": ["selector"]},
+                },
+                {
+                    "if": {"properties": {"condition": {"const": "text-contains"}}},
+                    "then": {"required": ["text"]},
+                },
+                {
+                    "if": {"properties": {"condition": {"const": "url-matches"}}},
+                    "then": {"required": ["pattern"]},
+                },
+            ],
+        },
+    },
+    {
+        "name": "input",
+        "description": (
+            "Send native browser input via the debugger: click, hover, scroll, "
+            "type, or key. Mouse actions require exactly one target: viewport "
+            "CSS x/y, selector with optional zero-based index, or a main-document "
+            "DOM ref from accessibility perception. Type/key optionally target "
+            "an element, otherwise use focus. Text is limited to 1 MiB UTF-8. "
+            "Modifiers ctrl/cmd/shift/alt are allowed except for type. Printable "
+            "key/Shift mappings use a US layout; type handles Unicode text. "
+            "Common macOS editing shortcuts include native commands listed in "
+            "editingCommands; other combinations dispatch key events only. "
+            "Dispatch success is not proof of application outcome."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "action": {
+                    "type": "string", "enum": ["click", "hover", "scroll", "type", "key"],
+                },
+                "x": {"type": "number", "minimum": 0, "maximum": 1000000},
+                "y": {"type": "number", "minimum": 0, "maximum": 1000000},
+                "selector": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "index": {**SAFE_ID_SCHEMA, "default": 0},
+                "ref": {"type": "string", "minLength": 1, "pattern": "\\S"},
+                "button": {
+                    "type": "string", "enum": ["left", "right", "middle"], "default": "left",
+                },
+                "clickCount": {"type": "integer", "minimum": 1, "maximum": 3, "default": 1},
+                "deltaX": {
+                    "type": "number", "minimum": -1000000, "maximum": 1000000, "default": 0,
+                },
+                "deltaY": {
+                    "type": "number", "minimum": -1000000, "maximum": 1000000, "default": 0,
+                },
+                "text": {
+                    "type": "string", "maxLength": 1048576,
+                    "description": "At most 1048576 bytes when encoded as UTF-8.",
+                },
+                "key": {
+                    "type": "string", "minLength": 1,
+                    "description": "A single character or supported named key, such as Enter.",
+                },
+                "modifiers": {
+                    "type": "array", "uniqueItems": True,
+                    "items": {"type": "string", "enum": ["ctrl", "cmd", "shift", "alt"]},
+                },
+            },
+            "required": ["tabId", "action"],
+            "additionalProperties": False,
+            "allOf": [
+                {
+                    "if": {"properties": {"action": {"enum": ["click", "hover", "scroll"]}}},
+                    "then": {"oneOf": INPUT_TARGET_SCHEMAS},
+                    "else": {"oneOf": [
+                        *INPUT_TARGET_SCHEMAS,
+                        {"not": {"anyOf": [{"required": [key]} for key in INPUT_TARGET_KEYS]}},
+                    ]},
+                },
+                *[
+                    {
+                        "if": {"properties": {"action": {"const": action}}},
+                        "then": {
+                            **({"required": required} if required else {}),
+                            "not": {"anyOf": [{"required": [key]} for key in
+                                             ("button", "clickCount", "deltaX", "deltaY",
+                                              "text", "key", "modifiers")
+                                             if key not in allowed]},
+                        },
+                    }
+                    for action, required, allowed in [
+                        ("click", [], ("button", "clickCount", "modifiers")),
+                        ("hover", [], ("modifiers",)),
+                        ("scroll", [], ("deltaX", "deltaY", "modifiers")),
+                        ("type", ["text"], ("text",)),
+                        ("key", ["key"], ("key", "modifiers")),
+                    ]
+                ],
+                {
+                    "if": {"properties": {"action": {"const": "scroll"}}},
+                    "then": {"anyOf": [
+                        {"required": [key], "properties": {key: {"not": {"const": 0}}}}
+                        for key in ("deltaX", "deltaY")
+                    ]},
+                },
+            ],
+        },
+    },
+    {
+        "name": "observe_start",
+        "description": (
+            "Start bounded console or network observation for a tab. " + OBSERVATION_POLICY
+            + "Network includeHeaders/includeBodies default false. maxBodyBytes "
+            "applies only when includeBodies is true and caps retained decoded/UTF-8 "
+            "bytes, not transient CDP transfers. Body retrieval is asynchronous; "
+            "inspect pendingBodies before stopping. Console rejects network flags."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "kind": {"type": "string", "enum": ["console", "network"]},
+                "maxEvents": {"type": "integer", "minimum": 1, "maximum": 5000, "default": 500},
+                "maxBytes": {
+                    "type": "integer", "minimum": 1024, "maximum": 8388608, "default": 1048576,
+                },
+                "includeHeaders": {"type": "boolean", "default": False},
+                "includeBodies": {"type": "boolean", "default": False},
+                "maxBodyBytes": {
+                    "type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536,
+                },
+            },
+            "required": ["tabId", "kind"],
+            "additionalProperties": False,
+            "allOf": [
+                {
+                    "if": {"properties": {"kind": {"const": "console"}}},
+                    "then": {"not": {"anyOf": [
+                        {"required": [key]}
+                        for key in ("includeHeaders", "includeBodies", "maxBodyBytes")
+                    ]}},
+                },
+                {
+                    "if": {"required": ["maxBodyBytes"]},
+                    "then": {
+                        "required": ["includeBodies"],
+                        "properties": {"includeBodies": {"const": True}},
+                    },
+                },
+            ],
+        },
+    },
+    {
+        "name": "observe_read",
+        "description": (
+            "Read an active observation snapshot without clearing by default; "
+            "clear:true drains the current buffer. " + OBSERVATION_POLICY
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "kind": {"type": "string", "enum": ["console", "network"]},
+                "clear": {"type": "boolean", "default": False},
+            },
+            "required": ["tabId", "kind"],
+            "additionalProperties": False,
+        },
+    },
+    {
+        "name": "observe_stop",
+        "description": (
+            "Stop an active observation, return its final snapshot and discard "
+            "the buffer, releasing its debugger hold. " + OBSERVATION_POLICY
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "tabId": SAFE_ID_SCHEMA,
+                "kind": {"type": "string", "enum": ["console", "network"]},
+            },
+            "required": ["tabId", "kind"],
+            "additionalProperties": False,
+        },
     },
 ]
 TOOL_NAMES = {tool["name"] for tool in TOOLS}
@@ -154,10 +516,274 @@ NAME_TO_COMMAND = {
     "tabs_create_mcp": "create",
     "tabs_close_mcp": "close",
 }
+NEW_COMMANDS = {
+    "read_page_ax": "read_page_ax",
+    "find_elements": "find",
+    "wait_for": "waitfor",
+    "assert_page": "assert",
+    "input": "input",
+    "observe_start": "observe_start",
+    "observe_read": "observe_read",
+    "observe_stop": "observe_stop",
+    "form_input": "type",
+}
+
+
+def integer_arg(args, key, default=None, minimum=None, maximum=None):
+    value = args.get(key, default)
+    if type(value) is not int:
+        raise BridgeError(f"{key} must be an integer")
+    if minimum is not None and value < minimum:
+        raise BridgeError(f"{key} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise BridgeError(f"{key} must be at most {maximum}")
+    return value
+
+
+def boolean_arg(args, key, default=False):
+    value = args.get(key, default)
+    if type(value) is not bool:
+        raise BridgeError(f"{key} must be a boolean")
+    return value
+
+
+def string_arg(args, key, nonempty=False):
+    value = args.get(key)
+    if not isinstance(value, str) or (nonempty and not value.strip()):
+        qualifier = "nonempty " if nonempty else ""
+        raise BridgeError(f"{key} must be a {qualifier}string")
+    return value
+
+
+def only_args(args, allowed):
+    unknown = set(args) - set(allowed)
+    if unknown:
+        raise BridgeError(f"unsupported or inapplicable arguments: {', '.join(sorted(unknown))}")
+
+
+def finite_number_arg(args, key, minimum=None, maximum=None, default=None):
+    value = args.get(key, default)
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        valid = False
+    if not valid:
+        raise BridgeError(f"{key} must be a finite number")
+    if minimum is not None and value < minimum:
+        raise BridgeError(f"{key} must be at least {minimum}")
+    if maximum is not None and value > maximum:
+        raise BridgeError(f"{key} must be at most {maximum}")
+    return value
+
+
+def input_arguments(args):
+    action = string_arg(args, "action")
+    payloads = {
+        "click": ("button", "clickCount", "modifiers"),
+        "hover": ("modifiers",),
+        "scroll": ("deltaX", "deltaY", "modifiers"),
+        "type": ("text",),
+        "key": ("key", "modifiers"),
+    }
+    if action not in payloads:
+        raise BridgeError(f"unsupported input action: {action}")
+    only_args(args, ("tabId", "action", *INPUT_TARGET_KEYS, *payloads[action]))
+    out = {"tabId": integer_arg(args, "tabId", minimum=0, maximum=MAX_SAFE_INTEGER),
+           "action": action}
+    targets = sum(("x" in args or "y" in args, "selector" in args, "ref" in args))
+    if targets > 1 or (action in ("click", "hover", "scroll") and targets != 1):
+        raise BridgeError("input requires exactly one target for mouse actions, at most one otherwise")
+    if "index" in args and "selector" not in args:
+        raise BridgeError("index is only allowed with selector")
+    if "x" in args or "y" in args:
+        out.update({key: finite_number_arg(args, key, 0, 1000000) for key in ("x", "y")})
+    elif "selector" in args:
+        out.update(
+            selector=string_arg(args, "selector", nonempty=True),
+            index=integer_arg(args, "index", 0, 0, MAX_SAFE_INTEGER),
+        )
+    elif "ref" in args:
+        out["ref"] = string_arg(args, "ref", nonempty=True)
+    if "modifiers" in args:
+        modifiers = args["modifiers"]
+        if (
+            not isinstance(modifiers, list)
+            or any(not isinstance(value, str) or value not in ("ctrl", "cmd", "shift", "alt")
+                   for value in modifiers)
+            or len(set(modifiers)) != len(modifiers)
+        ):
+            raise BridgeError("modifiers must be a unique array of ctrl, cmd, shift, alt")
+        out["modifiers"] = list(modifiers)
+    if action == "click":
+        button = args.get("button", "left")
+        if button not in ("left", "right", "middle"):
+            raise BridgeError("button must be left, right, or middle")
+        out.update(button=button, clickCount=integer_arg(args, "clickCount", 1, 1, 3))
+    elif action == "scroll":
+        out.update({key: finite_number_arg(args, key, -1000000, 1000000, 0)
+                    for key in ("deltaX", "deltaY")})
+        if not out["deltaX"] and not out["deltaY"]:
+            raise BridgeError("scroll requires at least one nonzero deltaX or deltaY")
+    elif action == "type":
+        text = string_arg(args, "text")
+        try:
+            size = len(text.encode("utf-8"))
+        except UnicodeEncodeError as exc:
+            raise BridgeError("text must be valid UTF-8") from exc
+        if size > 1048576:
+            raise BridgeError("text exceeds 1 MiB UTF-8")
+        out["text"] = text
+    elif action == "key":
+        key = string_arg(args, "key")
+        if not key:
+            raise BridgeError("key must be a nonempty string")
+        out["key"] = key
+    return out
+
+
+def observation_arguments(name, args):
+    allowed = ["tabId", "kind"]
+    if name == "observe_start":
+        allowed += ["maxEvents", "maxBytes", "includeHeaders", "includeBodies", "maxBodyBytes"]
+    elif name == "observe_read":
+        allowed += ["clear"]
+    only_args(args, allowed)
+    kind = string_arg(args, "kind")
+    if kind not in ("console", "network"):
+        raise BridgeError("kind must be console or network")
+    out = {"tabId": integer_arg(args, "tabId", minimum=0, maximum=MAX_SAFE_INTEGER),
+           "kind": kind}
+    if name == "observe_start":
+        out.update(
+            maxEvents=integer_arg(args, "maxEvents", 500, 1, 5000),
+            maxBytes=integer_arg(args, "maxBytes", 1048576, 1024, 8388608),
+        )
+        if kind == "console":
+            only_args(args, ("tabId", "kind", "maxEvents", "maxBytes"))
+        else:
+            out.update(includeHeaders=boolean_arg(args, "includeHeaders"),
+                       includeBodies=boolean_arg(args, "includeBodies"))
+            if "maxBodyBytes" in args and not out["includeBodies"]:
+                raise BridgeError("maxBodyBytes requires includeBodies:true")
+            if out["includeBodies"]:
+                out["maxBodyBytes"] = integer_arg(args, "maxBodyBytes", 65536, 1, 1048576)
+    elif name == "observe_read":
+        out["clear"] = boolean_arg(args, "clear")
+    return out
+
+
+def form_arguments(args):
+    only_args(args, ("tabId", "selector", "value", "submit", "index", "by"))
+    value = args.get("value")
+    if type(value) in (int, float):
+        finite_number_arg(args, "value")
+    elif not isinstance(value, (str, bool)) and not (
+        isinstance(value, list) and all(isinstance(item, str) for item in value)
+    ):
+        raise BridgeError("value must be a string, boolean, finite number, or array of strings")
+    out = {
+        "tabId": integer_arg(args, "tabId", minimum=0, maximum=MAX_SAFE_INTEGER),
+        "selector": string_arg(args, "selector", nonempty=True),
+        "text": value,
+        "submit": boolean_arg(args, "submit"),
+    }
+    if "index" in args:
+        out["index"] = integer_arg(args, "index", minimum=0, maximum=MAX_SAFE_INTEGER)
+    if "by" in args:
+        if args["by"] not in ("value", "label"):
+            raise BridgeError("by must be value or label")
+        out["by"] = args["by"]
+    return out
+
+
+def new_command(name, args):
+    if name == "input":
+        return {"cmd": NEW_COMMANDS[name], "args": input_arguments(args)}
+    if name.startswith("observe_"):
+        return {"cmd": NEW_COMMANDS[name], "args": observation_arguments(name, args)}
+    if name == "form_input":
+        return {"cmd": NEW_COMMANDS[name], "args": form_arguments(args)}
+    command_args = {"tabId": integer_arg(args, "tabId", minimum=0)}
+    if name == "read_page_ax":
+        command_args.update(
+            limit=integer_arg(args, "limit", 1000, 1, 5000),
+            includeIgnored=boolean_arg(args, "includeIgnored"),
+        )
+    elif name == "find_elements":
+        for key in ("role", "name", "text"):
+            if key in args:
+                command_args[key] = string_arg(args, key, nonempty=True)
+        if len(command_args) == 1:
+            raise BridgeError("find_elements requires at least one nonempty role, name, text")
+        command_args.update(
+            exact=boolean_arg(args, "exact"),
+            limit=integer_arg(args, "limit", 40, 1, 5000),
+        )
+    elif name == "wait_for":
+        command_args.update(
+            selector=string_arg(args, "selector", nonempty=True),
+            timeout=integer_arg(args, "timeout", 15000, 1, 30000),
+        )
+    elif name == "assert_page":
+        condition = string_arg(args, "condition")
+        if condition not in ("visible", "enabled", "text-contains", "url-matches"):
+            raise BridgeError(f"unsupported assertion condition: {condition}")
+        command_args.update(
+            condition=condition,
+            timeout=integer_arg(args, "timeout", 0, 0, 30000),
+        )
+        for key in ("selector", "text", "pattern"):
+            if key in args:
+                string_arg(args, key, nonempty=key == "selector")
+        if condition == "url-matches":
+            command_args["pattern"] = string_arg(args, "pattern")
+        else:
+            command_args["selector"] = string_arg(args, "selector", nonempty=True)
+            if condition == "text-contains":
+                command_args["text"] = string_arg(args, "text")
+    return {"cmd": NEW_COMMANDS[name], "args": command_args}
+
+
+def screenshot_options(args):
+    def finite_number(value):
+        try:
+            return type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            return False
+
+    options = {}
+    if "fullPage" in args:
+        options["fullPage"] = boolean_arg(args, "fullPage")
+    if options.get("fullPage") and "region" in args:
+        raise BridgeError("fullPage:true and region are mutually exclusive")
+    if "region" in args:
+        region = args["region"]
+        keys = {"x", "y", "width", "height"}
+        if not isinstance(region, dict) or set(region) != keys:
+            raise BridgeError("region must contain exactly x, y, width, height")
+        for key, value in region.items():
+            if (
+                not finite_number(value)
+                or (value < 0 if key in ("x", "y") else value <= 0)
+            ):
+                bound = "nonnegative" if key in ("x", "y") else "positive"
+                raise BridgeError(f"region.{key} must be a finite {bound} number")
+        options["region"] = dict(region)
+    if "scale" in args:
+        value = args["scale"]
+        if (
+            not finite_number(value)
+            or not 0 < value <= 2
+        ):
+            raise BridgeError("scale must be a finite number greater than 0 and at most 2")
+        options["scale"] = value
+    return options
 
 
 def batch_step(name, args):
     """Translate an MCP tool call to the extension's command vocabulary."""
+    if name in NEW_COMMANDS:
+        return new_command(name, args)
     if name == "tabs_context_mcp":
         return {"cmd": "tabs", "args": {}}
     if name == "read_page":
@@ -171,16 +797,6 @@ def batch_step(name, args):
                 },
             }
         return {"cmd": "text", "args": {"tabId": args["tabId"]}}
-    if name == "form_input":
-        return {
-            "cmd": "type",
-            "args": {
-                "tabId": args["tabId"],
-                "selector": args["selector"],
-                "text": args["value"],
-                "submit": args.get("submit", False),
-            },
-        }
     if name == "computer":
         action = args["action"]
         if action == "click":
@@ -196,13 +812,18 @@ def batch_step(name, args):
                 "text": args.get("text", ""),
                 "submit": args.get("submit", False),
             }
-        elif action in ("activate", "screenshot"):
+        elif action == "activate":
             command_args = {"tabId": args["tabId"]}
+        elif action == "screenshot":
+            command_args = {
+                "tabId": integer_arg(args, "tabId", minimum=0),
+                **screenshot_options(args),
+            }
         else:
             raise BridgeError(f"unsupported computer action in batch: {action}")
         return {"cmd": action, "args": command_args}
     if name == "list_connected_browsers":
-        return {"cmd": "ping", "args": {}}
+        return {"cmd": "browser_info", "args": {}}
     if name == "browser_batch":
         raise BridgeError("nested browser_batch is not supported")
     command = NAME_TO_COMMAND.get(name)
@@ -234,6 +855,8 @@ class Server:
     def call(self, name, args):
         if name not in TOOL_NAMES:
             raise BridgeError(f"unknown tool: {name}")
+        if not isinstance(args, dict):
+            raise BridgeError("tool arguments must be an object")
 
         # Translate and validate before opening the browser channel. Invalid
         # tool calls must fail immediately rather than waiting 35 seconds for
@@ -256,8 +879,36 @@ class Server:
                         "browser_batch action requires string name and object input"
                     )
                 translated_batch.append(batch_step(tool_name, tool_input))
+        else:
+            translated = batch_step(name, args)
 
         chrome = self.connection()
+
+        if name in ("input", "observe_start", "observe_read", "observe_stop", "form_input"):
+            options = dict(translated["args"])
+            tab = options.pop("tabId")
+            if name == "input":
+                return chrome.input(tab, options.pop("action"), **options)
+            if name == "form_input":
+                return chrome.form_input(
+                    tab, options.pop("selector"), options.pop("text"), **options,
+                )
+            kind = options.pop("kind")
+            if name == "observe_start":
+                for camel, snake in (
+                    ("maxEvents", "max_events"), ("maxBytes", "max_bytes"),
+                    ("includeHeaders", "include_headers"), ("includeBodies", "include_bodies"),
+                    ("maxBodyBytes", "max_body_bytes"),
+                ):
+                    if camel in options:
+                        options[snake] = options.pop(camel)
+                return chrome.observe_start(tab, kind, **options)
+            if name == "observe_read":
+                return chrome.observe_read(tab, kind, **options)
+            return chrome.observe_stop(tab, kind)
+
+        if name in NEW_COMMANDS:
+            return chrome.call(translated["cmd"], **translated["args"])
 
         if name == "tabs_context_mcp":
             tabs = chrome.tabs()
@@ -274,14 +925,6 @@ class Server:
                     args.get("limit", 40),
                 )
             return chrome.text(args["tabId"])
-
-        if name == "form_input":
-            return chrome.type(
-                args["tabId"],
-                args["selector"],
-                args["value"],
-                args.get("submit", False),
-            )
 
         if name == "computer":
             action = args["action"]
@@ -302,13 +945,17 @@ class Server:
             if action == "activate":
                 return chrome.activate(tab)
             if action == "screenshot":
-                return chrome.screenshot(tab)
+                options = dict(translated["args"])
+                del options["tabId"]
+                if "fullPage" in options:
+                    options["full_page"] = options.pop("fullPage")
+                return chrome.screenshot(tab, **options)
 
         if name == "browser_batch":
             return chrome.batch(translated_batch)
 
         if name == "list_connected_browsers":
-            return [{"name": "local Chromium", "connected": True}]
+            return chrome.call("browser_info")
 
         command = NAME_TO_COMMAND.get(name)
         if command:
@@ -318,12 +965,103 @@ class Server:
         raise BridgeError(f"unsupported tool: {name}")
 
 
+def png_base64(value):
+    """Recognize PNG data URLs without treating arbitrary base64 as an image."""
+    if not isinstance(value, str):
+        return None
+    header, comma, payload = value.partition(",")
+    parts = header.split(";")
+    if not comma or parts[0].lower() != "data:image/png":
+        return None
+    encoded = parts[-1].lower() == "base64"
+    parameters = parts[1:-1] if encoded else parts[1:]
+    if any("=" not in part for part in parameters):
+        return None
+    try:
+        data = urllib.parse.unquote_to_bytes(payload)
+        if encoded:
+            data = base64.b64decode(data, validate=True)
+    except (ValueError, binascii.Error):
+        return None
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return None
+    offset = 8
+    seen_data = False
+    while offset + 12 <= len(data):
+        length = struct.unpack_from(">I", data, offset)[0]
+        end = offset + 12 + length
+        if end > len(data):
+            return None
+        kind = data[offset + 4:offset + 8]
+        chunk = data[offset + 8:end - 4]
+        expected_crc = struct.unpack_from(">I", data, end - 4)[0]
+        if zlib.crc32(data[offset + 4:end - 4]) != expected_crc:
+            return None
+        if offset == 8:
+            if kind != b"IHDR" or length != 13:
+                return None
+            width, height, depth, color, compression, filtering, interlace = (
+                struct.unpack(">IIBBBBB", chunk)
+            )
+            depths = {
+                0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8),
+                4: (8, 16), 6: (8, 16),
+            }
+            if (
+                not width or not height or depth not in depths.get(color, ())
+                or compression != 0 or filtering != 0 or interlace not in (0, 1)
+            ):
+                return None
+        elif kind == b"IHDR":
+            return None
+        if kind == b"IDAT":
+            seen_data = True
+        if kind == b"IEND":
+            if length == 0 and end == len(data) and seen_data:
+                return base64.b64encode(data).decode("ascii")
+            return None
+        offset = end
+    return None
+
+
 def text_result(value, is_error=False):
-    text = value if isinstance(value, str) else json.dumps(value, indent=2)
-    result = {"content": [{"type": "text", "text": text}]}
+    images = []
+
+    def replace_images(item, path="$"):
+        encoded = png_base64(item)
+        if encoded is not None:
+            images.append({"type": "image", "data": encoded, "mimeType": "image/png"})
+            return f"[MCP image {len(images)} at {path}]"
+        if isinstance(item, dict):
+            return {
+                key: replace_images(child, f"{path}[{json.dumps(key)}]")
+                for key, child in item.items()
+            }
+        if isinstance(item, list):
+            return [
+                replace_images(child, f"{path}[{index}]")
+                for index, child in enumerate(item)
+            ]
+        return item
+
+    replaced = replace_images(value)
+    text = replaced if isinstance(replaced, str) else json.dumps(replaced, indent=2)
+    result = {"content": [{"type": "text", "text": text}, *images]}
     if is_error:
         result["isError"] = True
     return result
+
+
+def assertion_failed(name, value):
+    if name == "assert_page":
+        return isinstance(value, dict) and value.get("passed") is False
+    if name == "browser_batch" and isinstance(value, list):
+        return any(
+            isinstance(step, dict) and step.get("cmd") == "assert"
+            and assertion_failed("assert_page", step.get("result"))
+            for step in value
+        )
+    return False
 
 
 def rpc_error(request_id, code, message):
@@ -381,7 +1119,8 @@ def handle(server, request):
                 request_id, -32602, "Invalid params"
             )
         try:
-            result = text_result(server.call(name, arguments))
+            value = server.call(name, arguments)
+            result = text_result(value, is_error=assertion_failed(name, value))
         except BridgeError as exc:
             server.reset()
             result = text_result(str(exc), is_error=True)

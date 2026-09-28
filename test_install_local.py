@@ -65,6 +65,15 @@ voice_template = (
 ).read_text()
 assert "__PYTHON__" not in voice_template
 assert "__RUNTIME__" not in voice_template
+installed_root = parallel_home / ".rappter-chrome"
+for name in ("cdp.js", "capture.js", "perception.js", "assertions.js",
+             "input.js", "forms.js", "observe.js"):
+    source = (root / "extension" / name).read_bytes()
+    assert (installed_root / "extension" / name).read_bytes() == source
+    assert (installed_root / "runtime" / "extension" / name).read_bytes() == source
+for name in ("test_cdp.js", "test_perception.js", "test_assertions.js",
+             "test_extension.js", "test_input.js", "test_forms.js", "test_observe.js"):
+    assert (installed_root / "runtime" / name).read_bytes() == (root / name).read_bytes()
 print("installer concurrency serialization passed")
 
 # Failure after the first directory swap must restore every old directory.

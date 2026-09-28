@@ -7,8 +7,9 @@
 **Drive your real, logged-in Edge/Chrome from GitHub Copilot CLI.**
 
 Not a headless throwaway browser — *your* browser, with your profile, your cookies, and your
-authenticated sessions. Navigate, click, type, screenshot, read the accessibility tree, run
-JavaScript, and inspect console and network traffic, all from Copilot CLI.
+authenticated sessions. Navigate, send browser-level input, fill form controls, screenshot,
+read the accessibility tree, observe console/network events, and run JavaScript from Copilot CLI.
+These capabilities run in our own extension, without a vendor dependency.
 
 Recommended — local extension, local stdio MCP, no vendor account:
 
@@ -80,16 +81,148 @@ Each browser profile receives a persistent instance ID, visible in the popup and
 multi-profile machines; every other profile is rejected instead of racing whichever connects
 first.
 
-### The 11 local tools
+### The 19 local tools
 
-`tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`, `navigate`, `get_page_text`,
-`read_page`, `form_input`, `computer`, `javascript_tool`, `browser_batch`, and
-`list_connected_browsers`.
+All tools below run in **our native local extension** without a vendor binary or account.
+All 15 previous names remain available. The action/observation additions are `input`,
+`observe_start`, `observe_read`, and `observe_stop`; `form_input` also supports typed controls.
 
-They preserve the core names from the compatibility bridge, so existing browser prompts need
-little or no adaptation. Ordinary click/type/read operations use declared functions through
-`chrome.scripting`; arbitrary JavaScript attaches `chrome.debugger` only for that call and detaches
-afterwards.
+| Local tools | Native implementation |
+| --- | --- |
+| `tabs_context_mcp`, `tabs_create_mcp`, `tabs_close_mcp`, `navigate` | Chrome tab APIs |
+| `get_page_text`, `read_page` | Existing text/CSS readers through declared page functions |
+| `form_input` | Native DOM setters for text/typed values, checkbox/radio checked state, select/option values or labels |
+| `computer` | Back-compatible DOM click/type/activate; viewport, full-page, or region screenshots |
+| `input` | CDP mouse clicks/hover/wheel, keyboard keys/modifiers, and text insertion |
+| `observe_start`, `observe_read`, `observe_stop` | Explicit bounded console/network capture sessions, with headers/bodies opt-in |
+| `javascript_tool` | CDP Runtime.evaluate, outside page CSP |
+| `read_page_ax` | CDP accessibility tree: roles, names, values, states, document-scoped references |
+| `find_elements` | Deterministic accessibility role/name/text matching, not arbitrary natural language |
+| `wait_for` | Existing CSS-element presence wait (`waitfor` extension command) |
+| `assert_page` | Structured visible/enabled/text-contains/url-matches checks |
+| `browser_batch` | Ordered dispatch, with images preserved as MCP image content |
+| `list_connected_browsers` | Actual connected extension instance ID, configured profile label, and socket state |
+
+Ordinary click/type/text operations use declared functions through `chrome.scripting` and
+do not attach a debugger. Browser-level input, observation, JavaScript, AX perception, and enhanced screenshots share a
+ref-counted CDP session per tab with serialized commands. The debugger banner is scoped
+to active CDP work plus a 250ms idle grace for consecutive calls, not the lifetime of the
+bridge connection. **Observation retains a lease and the debugger banner until stopped.**
+A debugger disconnect invalidates that session; the next operation can attach afresh.
+
+`computer` with `action: "screenshot"` keeps visible-tab capture as its default.
+Set `fullPage: true`, or `region: {x, y, width, height}` in CSS page coordinates, to use
+CDP capture; these modes are mutually exclusive. Optional `scale` is greater than zero
+and at most 2. Captures are limited to 16384 pixels per dimension, 32000000 pixels total,
+and 32 MiB of base64; guards check both requested dimensions and actual PNG dimensions.
+Oversize requests fail explicitly rather than silently clipping. An enhanced-capture failure
+never disguises a viewport image as a full-page image. PNGs become MCP image blocks, including inside
+batches; surrounding result metadata remains text with image references.
+
+`read_page_ax` accepts `limit` and `includeIgnored`; `find_elements` accepts any combination
+of `role`, `name`, and `text` (AND matching), plus `exact` and `limit`. Roles are
+case-insensitive exact matches; names/text use case-insensitive substring matching unless
+`exact: true`. Text is whitespace-normalized AX value plus exposed descendant StaticText
+(or otherwise unrepresented InlineTextBox) names, not accessible labels alone.
+References identify nodes in the current document, **invalidate on navigation or reload**,
+and are not CSS selectors accepted by the existing click/type tools. DOM references survive
+debugger reattachment; virtual AX references are structural and can change with text/layout.
+Snapshots explicitly cover the **main document only**: iframe elements can appear, but
+child-frame documents are excluded. Accessibility does not describe every rendered pixel.
+
+`input` provides browser-level actions without changing `computer`:
+
+```json
+{"tabId":7,"action":"click","selector":"button.save","button":"left","clickCount":2}
+{"tabId":7,"action":"hover","ref":"ax:7:document-id:d:101"}
+{"tabId":7,"action":"scroll","x":400,"y":300,"deltaY":600}
+{"tabId":7,"action":"type","selector":"#message","text":"Hello"}
+{"tabId":7,"action":"key","key":"a","modifiers":["cmd"]}
+```
+
+Mouse actions require exactly one target: viewport CSS coordinates `{x,y}`, a CSS
+`selector` with optional zero-based `index`, or a DOM `ref` from AX perception. Selectors
+and refs cover the main document and must resolve to visible, unobscured geometry.
+Virtual/stale refs fail explicitly. Clicks support `left`, `right`, and `middle` buttons
+and `clickCount` 1, 2, or 3. `hover` moves the pointer; `scroll` uses CSS-pixel `deltaX`/
+`deltaY`. `type` inserts Unicode text with CDP `Input.insertText`; `key` sends a key with
+optional `ctrl`, `cmd`, `shift`, and `alt` modifiers. Keyboard targets are optional:
+a supplied target is clicked to focus it; otherwise input goes to current focus.
+These actions are real browser input, not DOM `.click()` or synthetic page events.
+Targets must already be in the viewport; there is no automatic scroll or DOM fallback.
+A successful dispatch is not proof of an application's outcome; read back or assert afterward.
+Named keys include Enter, Tab, Escape, Backspace, Delete, arrows, Home/End, PageUp/PageDown,
+Space, and F1-F24. Printable key/Shift mappings use a US keyboard layout; use `type` for
+arbitrary Unicode text. On macOS, common Cmd editing shortcuts (A/C/X/V/Z, Shift+Z/V),
+Cmd arrow navigation, Alt word movement, their Shift selection variants, and Cmd/Alt
+deletion also send native editing commands. Other combinations dispatch key events only;
+the result's `editingCommands` lists exactly which editing commands were applied.
+
+`form_input` retains `tabId`, `selector`, `value`, and optional `submit`, adding optional
+`index` and `by: "value" | "label"`. Boolean values set checkbox/radio checked state;
+string/number values fill supported typed inputs; strings select an option by its value
+or visible label. Arrays of strings select multiple values/labels in a multi-select.
+Booleans are rejected on other controls; `by: "label"` is only valid for select/option.
+Checkbox writes clear mixed (`indeterminate`) presentation. Labels match case-sensitively
+after whitespace normalization, using a nonempty `label` attribute or else text content.
+An `<option>` target updates its owning select. Native setters notify frameworks via
+input/change events and verify the resulting value; disabled, missing, ambiguous, or
+rejected values fail explicitly. This path is **DOM-setter compatibility input**, not
+trusted CDP input; its legacy `submit` synthesizes Enter events. Use `input` with
+`action: "key", key: "Enter"` when browser-level keyboard submission is needed.
+
+#### Console/network privacy and retention
+
+Call `observe_start` with `tabId` and `kind: "console" | "network"` before the work to
+observe, then `observe_read` with the same pair, and always `observe_stop` when finished.
+Each kind has an independent session; duplicate starts and reads/stops without a session
+are errors. Read is non-destructive unless `clear: true`; stop returns a final snapshot,
+discards the session, and releases its debugger lease.
+
+Returned capture buffers live **only in extension worker memory**, bounded by both `maxEvents` (default
+500, maximum 5000) and serialized UTF-8 `maxBytes` (default 1 MiB, maximum 8 MiB).
+Results include timestamps, navigation generation, and session-lifetime dropped-event counts.
+Top-document navigation/reload resets buffered events; same-document history changes do not.
+Tab closure, debugger detach, stop, and worker eviction discard
+capture state. This is explicit diagnostic capture, not durable logging or guaranteed
+historical retrieval. Chrome may replay cached console/log entries when a domain is enabled.
+
+Console captures console API calls, exceptions, and browser log entries. Network captures
+request/response/completion/failure metadata, **not request bodies**. Headers are omitted
+unless `includeHeaders: true`; response bodies require `includeBodies: true` on start.
+Only that opt-in permits `Network.getResponseBody`. Optional `maxBodyBytes` then bounds
+retained bodies (default 64 KiB, maximum 1 MiB); truncation/fetch failures are reported.
+These flags apply only to network sessions. Pending body work and request bookkeeping
+are bounded too. Body fetches are asynchronous: inspect `pendingBodies` and read again
+before stopping if those results matter. Stop does not wait for pending bodies and
+reports discarded work. CDP can transiently deliver a whole body before the extension
+truncates it; `maxBodyBytes` limits retained decoded/UTF-8 bytes, not peak transfer size.
+CDP content buffers are capped too; browser eviction can make oversized bodies unavailable
+rather than truncated. Capture flags govern extension retention/output, not browser caches
+or transient CDP payloads. Shared domains are not disabled while another CDP lease is active.
+Events cover the root debugger target (including same-process subframes); separate
+child debugger sessions are excluded.
+
+**URLs and console messages can contain secrets even with both flags off.** Opted-in
+headers/bodies may expose credentials or private content. Read/stop results go to the
+MCP caller and may be retained by that caller; extension memory bounds do not govern
+downstream retention. Enable capture only for the intended tab, request sensitive fields
+deliberately, and stop promptly.
+
+`wait_for` takes `tabId`, `selector`, and optional `timeout` in milliseconds (default 15000).
+`assert_page` takes `condition` (`visible`, `enabled`, `text-contains`, or `url-matches`),
+`selector` for element checks, `text` for text checks, or a JavaScript regex `pattern` for URL
+checks. Its optional `timeout` defaults to 0 (check now); waits are bounded to 30000 ms.
+Element assertions use the first CSS match. Text checks are literal, case-sensitive
+substrings (form controls use their value); URL regexes are case-sensitive.
+Unmet assertions return structured `passed: false` and MCP `isError`, including in batches;
+a failed batch assertion stops before subsequent actions and retains results through the
+failed check. Invalid inputs and browser failures raise errors. URL waits listen to tab updates.
+
+The separate **Claude compatibility backend** still supplies its own larger tool surface
+(including its own observation API and browser selection). Its schemas in
+`docs/tools.json` are not a list of native local capabilities. Local identity reporting
+describes the selected connected profile only, not every installed browser.
 
 ### Security boundary
 
@@ -223,8 +356,15 @@ template; active services are detected and restarted during upgrades.
 ```bash
 cd ~/.rappter-chrome/runtime
 python3 test_bridge.py           # 19 protocol/security/profile checks
-python3 test_mcp.py              # JSON-RPC recovery, 11 tools, batch translations
+python3 test_mcp.py              # JSON-RPC, 19 tools, batch mappings, images, identity
 python3 test_gvoice.py           # cold start and stale-thread refusal
+node test_cdp.js                 # shared CDP sessions and bounded capture
+node test_perception.js          # AX snapshots, references, matching
+node test_assertions.js          # structured checks and event cleanup
+node test_extension.js           # classic-worker loading and dispatch integration
+node test_input.js               # browser-level mouse/keyboard, targets, cleanup
+node test_forms.js               # checked/selected/typed control states and events
+node test_observe.js             # bounded console/network sessions and privacy
 python3 test_voice_assistant.py  # crash, injection, identity assertions
 python3 test_voice_twin.py       # RAPP/1 identity, frames, hatch, replay
 python3 test_messaging_transport.py # shared FIFO/trust/no-resend
@@ -416,7 +556,7 @@ install-local.sh                  vendorless installer
 install_local.py                  portable local installer
 extension/                        vendorless MV3 extension
 bridge.py                         zero-dependency localhost WebSocket transport
-rappter_chrome_mcp.py             11-tool stdio MCP server
+rappter_chrome_mcp.py             15-tool native stdio MCP server
 gvoice.py                         account-locked Google Voice browser driver
 voice_assistant.py                exactly-once Google Voice transport loop
 voice_twin.py                     durable curated Brainstem twin runtime
@@ -438,6 +578,10 @@ com.rapp.digital-understudy.plist.template  30-day resident study
 rappter-voice-assistant.service.template Linux user service
 test_bridge.py                    protocol and security tests
 test_mcp.py                       MCP protocol smoke test
+test_cdp.js                       shared CDP lifecycle and screenshot guards
+test_perception.js                accessibility references and matching
+test_assertions.js                assertion conditions and waits
+test_extension.js                 worker loading and dispatch integration
 test_gvoice.py                    browser cold-start and DOM-settle tests
 test_voice_assistant.py           message-loop safety tests
 test_voice_twin.py                twin, RAPP/1, and RAPP Messaging tests

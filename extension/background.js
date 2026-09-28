@@ -177,6 +177,9 @@ async function handleMessage(sock, raw, auth, token) {
   }
 }
 
+// Classic MV3 workers load these locally; no remote code or vendor runtime.
+importScripts("cdp.js", "capture.js", "perception.js", "assertions.js", "input.js", "forms.js", "observe.js");
+
 // ── page-side functions ─────────────────────────────────────────────────────
 // These are DECLARED functions handed to chrome.scripting, never strings run
 // through eval. MV3 forbids unsafe-eval in the extension, and a page's own CSP
@@ -202,32 +205,6 @@ function _click(selector, index) {
   return { clicked: selector, matched: els.length };
 }
 
-function _type(selector, text, submit) {
-  const el = document.querySelector(selector);
-  if (!el) throw new Error(`no element for ${selector}`);
-  el.focus();
-  const proto = el instanceof HTMLTextAreaElement
-    ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-  const setter = Object.getOwnPropertyDescriptor(proto, "value")?.set;
-  // React and friends listen for the native setter, not for .value =. Without
-  // this, text appears in the box and the app never sees it — the field looks
-  // filled and submits empty.
-  if (setter && (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement)) {
-    setter.call(el, text);
-  } else if (el.isContentEditable) {
-    el.textContent = text;
-  } else {
-    el.value = text;
-  }
-  el.dispatchEvent(new Event("input", { bubbles: true }));
-  el.dispatchEvent(new Event("change", { bubbles: true }));
-  if (submit) {
-    el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-    el.dispatchEvent(new KeyboardEvent("keyup", { key: "Enter", code: "Enter", keyCode: 13, bubbles: true }));
-  }
-  return { typed: text.length, selector };
-}
-
 function _query(selector, limit) {
   return [...document.querySelectorAll(selector)].slice(0, limit || 40).map((el, i) => ({
     i,
@@ -245,11 +222,12 @@ function _waitFor(selector, timeoutMs) {
     const obs = new MutationObserver(() => {
       if (document.querySelector(selector)) {
         obs.disconnect();
+        clearTimeout(timer);
         resolve({ found: true, waitedMs: Date.now() - t0 });
       }
     });
-    obs.observe(document.documentElement, { childList: true, subtree: true });
-    setTimeout(() => {
+    obs.observe(document.documentElement, { childList: true, subtree: true, attributes: true });
+    const timer = setTimeout(() => {
       obs.disconnect();
       reject(new Error(`timeout after ${timeoutMs}ms waiting for ${selector}`));
     }, timeoutMs || 15000);
@@ -264,26 +242,25 @@ async function inPage(tabId, func, args) {
 }
 
 // ── arbitrary JS via the debugger ───────────────────────────────────────────
-// The one operation declared functions cannot cover. Runtime.evaluate runs
+// Runtime.evaluate covers what declared functions cannot. It runs
 // outside the page's CSP, so it works on sites that forbid eval — which is most
-// of the ones with a login. It attaches the debugger for the duration and
-// detaches after, so the banner is scoped to the call that needed it.
+// of the ones with a login. CDP users share one attachment per tab; the banner
+// is scoped to that work and a short idle grace, not the bridge connection.
 async function evalJs(tabId, code, awaitPromise) {
-  const target = { tabId };
-  await chrome.debugger.attach(target, "1.3");
+  const lease = await cdpSessions.acquire(tabId);
   try {
-    const r = await chrome.debugger.sendCommand(target, "Runtime.evaluate", {
+    const r = await cdpSessions.send(tabId, "Runtime.evaluate", {
       expression: code,
       returnByValue: true,
       awaitPromise: awaitPromise !== false,
       userGesture: true,
-    });
+    }, lease);
     if (r.exceptionDetails) {
       throw new Error(r.exceptionDetails.exception?.description || "JS exception");
     }
     return r.result?.value;
   } finally {
-    try { await chrome.debugger.detach(target); } catch { /* already gone */ }
+    await cdpSessions.release(tabId, lease);
   }
 }
 
@@ -323,6 +300,14 @@ async function dispatch(cmd, a) {
   switch (cmd) {
     case "ping":
       return { pong: true, at: Date.now() };
+
+    case "browser_info": {
+      const { instanceId, profileName } = await cfg();
+      return [{
+        name: "local Chromium", instanceId, profileName,
+        connected: !!ws && ws.readyState === WebSocket.OPEN,
+      }];
+    }
 
     case "reload_extension":
       // Reply first so the installer can prove the command arrived, then
@@ -376,23 +361,41 @@ async function dispatch(cmd, a) {
     case "query":
       return await inPage(a.tabId, _query, [a.selector, a.limit]);
 
+    case "read_page_ax":
+      return await readPageAX(a);
+
+    case "find":
+      return await findElements(a);
+
     case "click":
       return await inPage(a.tabId, _click, [a.selector, a.index]);
 
     case "type":
-      return await inPage(a.tabId, _type, [a.selector, a.text, !!a.submit]);
+      return await formInput(a);
+
+    case "input":
+      return await browserInput(a);
+
+    case "observe_start":
+      return await observeStart(a);
+
+    case "observe_read":
+      return await observeRead(a);
+
+    case "observe_stop":
+      return await observeStop(a);
 
     case "waitfor":
       return await inPage(a.tabId, _waitFor, [a.selector, a.timeout]);
 
+    case "assert":
+      return await assertPage(a);
+
     case "eval":
       return await evalJs(a.tabId, a.code, a.awaitPromise);
 
-    case "screenshot": {
-      const t = await chrome.tabs.get(a.tabId);
-      await chrome.tabs.update(a.tabId, { active: true });
-      return await chrome.tabs.captureVisibleTab(t.windowId, { format: "png" });
-    }
+    case "screenshot":
+      return await captureScreenshot(a);
 
     case "batch": {
       // One round trip for a whole sequence, in order, stopping at the first
@@ -400,7 +403,9 @@ async function dispatch(cmd, a) {
       // flow should not cost five round trips.
       const out = [];
       for (const step of a.actions || []) {
-        out.push({ cmd: step.cmd, result: await dispatch(step.cmd, step.args || {}) });
+        const result = await dispatch(step.cmd, step.args || {});
+        out.push({ cmd: step.cmd, result });
+        if (step.cmd === "assert" && result.passed === false) break;
       }
       return out;
     }
