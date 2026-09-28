@@ -260,6 +260,14 @@ try:
 except RuntimeError as exc:
     assert "frame kind is invalid" in str(exc)
 first_frame_path.write_bytes(first_frame_bytes)
+# A duplicate member name is refused even when both values agree (rev-17 section 4).
+first_frame_path.write_bytes(first_frame_bytes[:-1] + b',"kind":"body.twin-pulse"}')
+try:
+    understudy._load_frames(identity)
+    raise AssertionError("a frame with a duplicate member name was accepted")
+except RuntimeError as exc:
+    assert "not RAPP/1 JSON" in str(exc)
+first_frame_path.write_bytes(first_frame_bytes)
 
 # Sensitive-category output and ungrounded evidence fail closed.
 bad_sensitive = fake_analysis(snapshot, {}, final=False)

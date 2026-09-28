@@ -366,6 +366,17 @@ with voice_twin.twin_lock():
     except RuntimeError as exc:
         assert "verified roster" in str(exc)
 
+# A RAPP/1 memory-stream instance is one lclabel of 1-64 characters
+# (rev-17 section 6.1.1), so a longer transport name cannot form a stream.
+long_transport = envelope("long-transport-event", transport="t" * 65)
+with voice_twin.twin_lock():
+    rappid = voice_twin.ensure_identity(cfg)
+    try:
+        voice_twin.channel_context(cfg, rappid, long_transport)
+        raise AssertionError("a 65-character stream instance was accepted")
+    except RuntimeError as exc:
+        assert "cannot form a RAPP memory stream" in str(exc)
+
 # Different audiences cannot enter each other's model history.
 original_run = voice_twin._run_twin
 captured_contexts = []

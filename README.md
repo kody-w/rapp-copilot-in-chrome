@@ -178,8 +178,8 @@ Each installation mints one canonical RAPP/1 rappid, appends exact eleven-key
 python3 ~/.rappter-chrome/runtime/build_voice_twin_egg.py
 ```
 
-The pinned rev-5 reference is byte-identical to
-`kody-w/rapp-1@d2cd5ab`. The implementation reports
+The pinned rev-17 reference is byte-identical to
+`kody-w/rapp-1@f6bafe7`. The implementation reports
 `structural-pre-acceptance`, not full/authenticated RAPP/1 conformance:
 registered genesis/trust, exact section-8 facade acceptance, and a Google Voice
 transport profile remain open at
@@ -430,7 +430,7 @@ UNIVERSAL_MESSAGING.md            channel setup and trust contract
 DIGITAL_UNDERSTUDY.md             30-day privacy/lifecycle contract
 digital_understudy.py             collector, analyzer, pulse, final report
 install_understudy.py             transactional LaunchAgent installer
-rapp1.py                          pinned rev-5 identity/frame/egg reference
+rapp1.py                          pinned rev-17 identity/frame/egg reference
 build_voice_twin_egg.py           deterministic RAPP/1 rapplication hatcher
 VOICE_TWIN_CONFORMANCE.json       explicit pre-acceptance boundary
 com.rapp.voice-assistant.plist.template  macOS resident service

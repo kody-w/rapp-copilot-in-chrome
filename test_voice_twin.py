@@ -180,6 +180,16 @@ assert len(frames) == 1
 assert set(frames[0]) == rapp1.FRAME_KEYS
 assert frames[0]["kind"] == "memory.chat-turn"
 assert frames[0]["payload"]["message_id"] == "a" * 20
+# A duplicate member name is refused even when both values agree (rev-17 section 4).
+first_frame_path = voice_twin.FRAME_DIR / f"{0:020d}.json"
+first_frame_bytes = first_frame_path.read_bytes()
+first_frame_path.write_bytes(first_frame_bytes[:-1] + b',"kind":"memory.chat-turn"}')
+try:
+    voice_twin._load_frames(f"{identity['rappid']}:google-voice")
+    raise AssertionError("a frame with a duplicate member name was accepted")
+except RuntimeError as exc:
+    assert "not RAPP/1 JSON" in str(exc)
+first_frame_path.write_bytes(first_frame_bytes)
 assert frames[0]["payload"]["agent_names"] == ["HackerNews"]
 assert voice_twin.successful_agent_names(
     '[HackerNews] {"status":"error","message":"offline"}'
@@ -342,7 +352,7 @@ reference_hash = hashlib.sha256(
     (voice_twin.HERE / "rapp1.py").read_bytes()
 ).hexdigest()
 assert reference_hash == (
-    "c945ee85f01af5cd374490b40721d07f2aca7c8bd6d209e0d2933420f55db284"
+    "76154a2b2e0a71cceda92c2c1b50a1cd8f7878b1892d0d093d523c4e5256eb87"
 )
 
 print("Voice Twin: RAPP/1 identity, frames, hatch, and replay checks passed")

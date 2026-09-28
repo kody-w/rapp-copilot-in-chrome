@@ -166,6 +166,17 @@ def _read_json(path):
         raise RuntimeError(f"Voice Twin state is unreadable: {path.name}") from exc
 
 
+def _read_frame(path):
+    """Parse a frame file as RAPP/1 section 4 JSON (rev-17), never leniently."""
+    path = Path(path)
+    try:
+        if path.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError("frame exceeds its limit")
+        return rapp1._strict_json(path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"Voice Twin frame is not RAPP/1 JSON: {path.name}") from exc
+
+
 @contextmanager
 def twin_lock():
     TWIN_ROOT.mkdir(parents=True, exist_ok=True)
@@ -425,7 +436,10 @@ def channel_context(cfg, rappid, envelope, *, preserve_event_id=False):
         "google-voice-web": "google-voice",
         "whatsapp-cloud": "whatsapp-cloud",
     }.get(transport, transport)
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", stream_instance):
+    if (
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", stream_instance)
+        or len(stream_instance) > 64
+    ):
         raise RuntimeError("transport cannot form a RAPP memory stream")
     binding = {
         "schema": "rapp-messaging-transport-binding/1.0",
@@ -799,7 +813,7 @@ def _load_frames(expected_stream_id, directory=None):
     for path in sorted(directory.glob("*.json")):
         if not re.fullmatch(r"\d{20}\.json", path.name):
             raise RuntimeError("Voice Twin frame directory contains an invalid file")
-        frame = _read_json(path)
+        frame = _read_frame(path)
         if not isinstance(frame, dict):
             raise RuntimeError("Voice Twin frame is invalid")
         ok, step, reason = rapp1.verify_frame(
