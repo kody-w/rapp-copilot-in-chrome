@@ -3,9 +3,9 @@
   "status": "structural-pre-acceptance",
   "rapp_1": {
     "authority_repository": "kody-w/rapp-1",
-    "authority_commit": "d2cd5abed48d3f52b86bbb975ac3558286d1db41",
+    "authority_commit": "f6bafe76735ba73510518810c8bc8cd133dcf527",
     "reference_file": "rapp1.py",
-    "reference_sha256": "c945ee85f01af5cd374490b40721d07f2aca7c8bd6d209e0d2933420f55db284",
+    "reference_sha256": "76154a2b2e0a71cceda92c2c1b50a1cd8f7878b1892d0d093d523c4e5256eb87",
     "implemented": [
       "mint-once keyless rappid",
       "exact eleven-key memory.chat-turn frames",

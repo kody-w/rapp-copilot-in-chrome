@@ -342,7 +342,7 @@ reference_hash = hashlib.sha256(
     (voice_twin.HERE / "rapp1.py").read_bytes()
 ).hexdigest()
 assert reference_hash == (
-    "c945ee85f01af5cd374490b40721d07f2aca7c8bd6d209e0d2933420f55db284"
+    "76154a2b2e0a71cceda92c2c1b50a1cd8f7878b1892d0d093d523c4e5256eb87"
 )
 
 print("Voice Twin: RAPP/1 identity, frames, hatch, and replay checks passed")
