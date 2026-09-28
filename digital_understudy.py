@@ -296,6 +296,17 @@ def read_json(path, *, max_bytes=8 * 1024 * 1024, default=None):
         raise RuntimeError(f"understudy source is invalid: {path.name}") from exc
 
 
+def read_frame(path):
+    """Parse a frame file as RAPP/1 section 4 JSON (rev-17), never leniently."""
+    path = Path(path)
+    try:
+        if path.stat().st_size > 8 * 1024 * 1024:
+            raise ValueError("frame exceeds its limit")
+        return rapp1._strict_json(path.read_bytes())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"understudy frame is not RAPP/1 JSON: {path.name}") from exc
+
+
 def load_config():
     value = read_json(CONFIG_FILE, default={})
     if not isinstance(value, dict):
@@ -1092,7 +1103,7 @@ def _load_frames(rappid):
     for path in sorted(FRAME_DIR.glob("*.json")):
         if not re.fullmatch(r"\d{20}\.json", path.name):
             raise RuntimeError("understudy frame directory is invalid")
-        frame = read_json(path)
+        frame = read_frame(path)
         ok, step, reason = rapp1.verify_frame(
             frame,
             head=head,
