@@ -425,7 +425,10 @@ def channel_context(cfg, rappid, envelope, *, preserve_event_id=False):
         "google-voice-web": "google-voice",
         "whatsapp-cloud": "whatsapp-cloud",
     }.get(transport, transport)
-    if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", stream_instance):
+    if (
+        not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", stream_instance)
+        or len(stream_instance) > 64
+    ):
         raise RuntimeError("transport cannot form a RAPP memory stream")
     binding = {
         "schema": "rapp-messaging-transport-binding/1.0",
