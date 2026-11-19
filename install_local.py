@@ -576,6 +576,11 @@ def install(args):
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         shared_token = module.token()
+        # Pair without pasting: the add-on reads this on first start (same trust as the token file, owner-only).
+        pairing = EXTENSION / "pairing.json"
+        write_bytes_atomic(pairing, json.dumps({"token": shared_token, "port": 8777,
+                                                "instanceId": module.preferred_instance() or None}).encode())
+        os.chmod(pairing, 0o600)
         reloaded_extensions = reload_extensions(module)
 
         if was_loaded:
