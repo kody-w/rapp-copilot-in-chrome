@@ -54,6 +54,17 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
 
 async function cfg() {
   const s = await chrome.storage.local.get(DEFAULTS);
+  // Pair without pasting: the installer drops pairing.json beside this file (same trust as the token file).
+  if (!s.token) {
+    try {
+      const p = await (await fetch(chrome.runtime.getURL("pairing.json"))).json();
+      if (p && p.token) {
+        Object.assign(s, { token: p.token, port: p.port || s.port });
+        if (p.instanceId) s.instanceId = p.instanceId;
+        await chrome.storage.local.set({ token: s.token, port: s.port, instanceId: s.instanceId });
+      }
+    } catch (_) { /* no pairing file: stay unconfigured */ }
+  }
   let instanceId = s.instanceId || "";
   if (!instanceId) {
     instanceId = crypto.randomUUID();
